@@ -1070,16 +1070,234 @@ access_control:
 
 ---
 
-## 12. 文件位置索引
+## 12. 令牌内省分支生效的前置条件
+
+### 12.1 认证策略顺序对 Bearer 解析的影响
+
+**核心代码位置**: `internal/handlers/handler_authz.go:160-185`
+
+认证策略采用**顺序执行、首胜终止**的机制：
+
+```go
+for _, strategy = range authz.strategies {
+    if authn, err = strategy.Get(ctx, provider, object); err != nil {
+        // 错误处理...
+    }
+
+    if authn.Level != authentication.NotAuthenticated {
+        break  // 首个认证成功的策略终止后续执行
+    }
+}
+```
+
+**默认策略顺序**（以 AuthRequest 实现为例）：
+```
+1. HeaderProxyAuthorizationAuthRequestAuthnStrategy (仅 Basic scheme)
+   ↓ （如果认证失败或未提供凭据）
+2. CookieSessionAuthnStrategy
+   ↓ （如果也未认证）
+   → 最终为 NotAuthenticated
+```
+
+**策略顺序的关键影响**：
+
+1. **Bearer 策略的优先级**
+   - 如果 Header 策略配置了 Bearer scheme，它会在 Cookie 策略之前执行
+   - 携带有效 Bearer Token 的请求会被优先识别为令牌认证
+   - Cookie 会话不会被触发
+
+2. **Basic 与 Bearer 的互斥性**
+   - 如果同时配置了 Basic 和 Bearer，请求只会匹配其中一个 scheme
+   - `Authorization: Basic xxx` 走密码认证流程
+   - `Authorization: Bearer xxx` 走令牌内省流程
+
+3. **Cookie 策略的兜底效应**
+   - 即使 Header 策略未认证成功，Cookie 策略仍可能认证成功
+   - 浏览器请求通常携带 Cookie，会优先走会话认证而非令牌认证
+
+### 12.2 Endpoint 未启用 Bearer Scheme 时的跳过机制
+
+**核心代码位置**: `internal/handlers/handler_authz_authn.go:236-257`
+
+当请求携带 Bearer Token 但 Endpoint 未启用 Bearer scheme 时：
+
+```go
+scheme := authn.Header.Authorization.Scheme()
+
+if !s.schemes.Has(scheme) {
+    ctx.Logger.
+        WithFields(map[string]any{
+            "scheme": authn.Header.Authorization.SchemeRaw(), 
+            "header": string(s.headerAuthorize)
+        }).
+        Debug("Skipping header authorization as the scheme and header combination is unknown to this endpoint configuration")
+
+    return authn, nil  // 直接返回，不执行后续认证逻辑
+}
+```
+
+**跳过行为的具体表现**：
+
+| 场景 | 行为 | 结果 |
+|------|------|------|
+| 请求带 Bearer Token 但 scheme 未配置 | Header 策略直接返回 | 继续执行下一个策略（通常是 Cookie） |
+| 请求带 Bearer Token 且 scheme 已配置 | 执行令牌内省流程 | Token 有效则认证成功，无效则返回错误 |
+| 请求既带 Cookie 又带 Bearer Token | Header 策略优先处理 | Bearer 有效则走令牌流程，无效 fallback 到 Cookie |
+
+**默认配置情况**：
+```yaml
+# DefaultServerConfiguration - 所有 Authz 端点默认
+endpoints:
+  authz:
+    auth-request:
+      authn_strategies:
+        - name: HeaderAuthorization
+          schemes: ["basic"]  # 默认仅启用 Basic，无 Bearer
+        - name: CookieSession
+```
+
+**关键结论**：默认配置下，Bearer Token 会被静默跳过，不会触发令牌内省。
+
+### 12.3 对 oauth2:client 规则命中的边界结论
+
+**命中的前置条件链**：
+```
+oauth2:client 规则命中
+   ↓ 必须
+ClientID 非空
+   ↓ 必须
+令牌内省流程被触发
+   ↓ 必须
+Header 策略在策略列表中
+   ↓ 必须
+Header 策略配置了 Bearer scheme
+   ↓ 必须
+请求携带 Authorization: Bearer xxx 头
+```
+
+**边界情况分析**：
+
+1. **边界 1：未启用 Bearer scheme（默认情况）**
+   ```
+   配置: schemes: ["basic"]（默认）
+   请求: Authorization: Bearer authelia_at_xxx
+   流程:
+     - Header 策略检测到 scheme 不匹配 → 跳过
+     - 继续执行 Cookie 策略
+     - Cookie 无会话 → NotAuthenticated
+     - Subject.ClientID = ""
+   结果: oauth2:client 规则永远无法命中
+   ```
+
+2. **边界 2：启用 Bearer 但策略顺序在 Cookie 之后**
+   ```
+   配置: authn_strategies: [CookieSession, HeaderAuthorization(basic, bearer)]
+   请求: 浏览器请求（带有效 Cookie + Bearer Token）
+   流程:
+     - Cookie 策略首先执行 → 会话认证成功
+     - 循环 break，Header 策略不执行
+     - Subject 来自会话，ClientID = ""
+   结果: oauth2:client 规则无法命中（被 Cookie 抢占）
+   ```
+
+3. **边界 3：启用 Bearer 且策略顺序正确**
+   ```
+   配置: authn_strategies: [HeaderAuthorization(basic, bearer), CookieSession]
+   请求: Authorization: Bearer authelia_at_xxx（客户端凭证令牌）
+   流程:
+     - Header 策略执行，scheme 匹配
+     - 令牌内省成功，识别为客户端凭证
+     - Subject.ClientID = 实际客户端 ID
+   结果: oauth2:client 规则可以命中
+   ```
+
+**配置最佳实践（oaut2:client 场景）**：
+```yaml
+endpoints:
+  authz:
+    api-gateway:
+      implementation: ExtAuthz
+      authn_strategies:
+        - name: HeaderAuthorization
+          schemes: ["bearer"]  # 仅启用 Bearer，避免 Basic 干扰
+          scheme_basic_cache_lifespan: 0s
+        - name: CookieSession
+```
+
+### 12.4 对双因素资源可达性的边界结论
+
+**客户端凭证令牌的双重限制**：
+```
+访问 two_factor 资源
+   ↓ 需要
+认证级别 = TwoFactor
+   ↓ 需要
+用户令牌 + amr 包含 mfa
+   ← 且 →
+Bearer scheme 已启用 + Header 策略顺序正确
+```
+
+**边界矩阵**：
+
+| 令牌类型 | Bearer 已启用 | 策略顺序正确 | 可访问 one_factor | 可访问 two_factor | 可命中 oauth2:client |
+|---------|--------------|-------------|-----------------|------------------|---------------------|
+| 客户端凭证 | ❌ | 任意 | ❌ | ❌ | ❌ |
+| 客户端凭证 | ✅ | ❌（Cookie 在前） | ❌ | ❌ | ❌ |
+| 客户端凭证 | ✅ | ✅ | ✅ | ❌（固定 OneFactor） | ✅ |
+| 用户令牌（1FA） | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 用户令牌（2FA + amr=mfa） | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+**关键边界结论**：
+
+1. **客户端凭证令牌的硬限制**：
+   - 无论如何配置，客户端凭证令牌的认证级别**永远是 OneFactor**
+   - 这是 OAuth 2.0 规范的设计：客户端凭证流程不涉及用户交互，无法完成 2FA
+   - **结论**：客户端凭证令牌永远无法访问 `policy: two_factor` 的资源
+
+2. **用户令牌的配置依赖**：
+   - 用户令牌访问 two_factor 资源依赖正确的 Endpoint 配置
+   - 必须同时满足：启用 Bearer scheme + Header 策略顺序正确
+   - 还需要用户实际完成了 2FA（amr 包含 mfa）
+
+3. **代理端点的隔离配置**：
+   - 建议为 API 调用和浏览器访问使用不同的 Authz 端点
+   - API 端点：仅 Header 策略 + 仅 Bearer scheme
+   - 浏览器端点：Cookie 策略优先 + Basic/Bearer 作为备选
+
+**实际配置建议**：
+```yaml
+endpoints:
+  authz:
+    # 专为 API 调用的端点 - 仅 Bearer
+    api-endpoint:
+      implementation: ExtAuthz
+      authn_strategies:
+        - name: HeaderAuthorization
+          schemes: ["bearer"]
+
+    # 专为浏览器的端点 - Cookie 优先
+    web-endpoint:
+      implementation: ForwardAuth
+      authn_strategies:
+        - name: CookieSession
+        - name: HeaderAuthorization
+          schemes: ["basic", "bearer"]
+```
+
+---
+
+## 13. 文件位置索引
 
 | 功能模块 | 文件路径 |
 |---------|--------|
 | 授权主处理器 | `internal/handlers/handler_authz.go` |
 | 认证策略实现 | `internal/handlers/handler_authz_authn.go` |
+| Bearer Token 内省逻辑 | `internal/handlers/handler_authz_authn.go:572-640` |
 | OIDC 授权处理 | `internal/handlers/handler_oauth2_authorization.go` |
 | OIDC 授权同意核心 | `internal/handlers/handler_oauth2_authorization_consent_core.go` |
 | OIDC 同意处理 | `internal/handlers/handler_oauth2_consent.go` |
-| 访问控制规则 | `internal/authorization/access_control_rule.go` |
+| 访问控制规则匹配 | `internal/authorization/access_control_rule.go` |
+| 访问控制 Subject 匹配器 | `internal/authorization/access_control_subjects.go` |
 | 授权级别常量 | `internal/authorization/const.go` |
 | Authorizer 核心 | `internal/authorization/authorizer.go` |
 | Subject/Object 类型 | `internal/authorization/types.go` |
