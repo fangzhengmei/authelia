@@ -32,11 +32,11 @@
     ├─ Authorizer.GetRequiredLevel()
     └─ 访问控制规则匹配
     ↓
-[最终响应]
-    ├─ 200 Authorized (认证通过)
-    ├─ 302 Found → 重定向到登录门户 (浏览器访问)
-    ├─ 401 Unauthorized → WWW-Authenticate 挑战 (API/非浏览器)
-    └─ 403 Forbidden (权限不足)
+[最终响应 (四种实现差异)]
+    ├─ Legacy: 唯一带 WWW-Authenticate 的实现
+    ├─ AuthRequest: 统一 401 + Location 重定向
+    ├─ ForwardAuth: 智能选择 302/303/401
+    └─ ExtAuthz: 同 ForwardAuth
 ```
 
 ---
@@ -601,7 +601,7 @@ return false, p.defaultPolicy
 ```go
 switch isAuthzResult(actual authentication.Level, required authorization.Level, hasSubjects bool) {
 case AuthzResultAuthorized:     // 200
-case AuthzResultUnauthorized:   // 401 或 302 重定向
+case AuthzResultUnauthorized:   // 401 或 302 重定向（视实现而定）
 case AuthzResultForbidden:      // 403
 }
 ```
@@ -626,70 +626,205 @@ case AuthzResultForbidden:      // 403
 
 ---
 
-## 八、未授权响应：302 重定向 vs 401 返回
+## 八、四种授权实现：未授权响应详细对比
 
-### 8.1 响应决策逻辑
+### 8.1 概述
 
-**文件位置**: `internal/handlers/handler_authz_impl_legacy.go:34-69`
+⚠️ **重要修正**: 之前结论"401 都带 WWW-Authenticate 挑战头"是错误的。
+
+**正确结论**: **只有 Legacy 实现在 Authorization 头部认证场景下才会设置 WWW-Authenticate 头部**。其他三种实现（AuthRequest、ForwardAuth、ExtAuthz）的 401 响应仅带 Location 重定向头，**不会设置 WWW-Authenticate**。
+
+---
+
+### 8.2 四种实现代码位置
+
+| 实现方式 | 处理函数 | 文件位置 | 适用反向代理 |
+|---------|---------|---------|-------------|
+| **Legacy** | `handleAuthzUnauthorizedLegacy` | `handler_authz_impl_legacy.go:34-70` | Traefik v1, Nginx |
+| **AuthRequest** | `handleAuthzUnauthorizedAuthRequest` | `handler_authz_impl_authrequest.go:39-48` | Nginx auth_request |
+| **ForwardAuth** | `handleAuthzUnauthorizedForwardAuth` | `handler_authz_impl_forwardauth.go:36-61` | Traefik v2+ |
+| **ExtAuthz** | `handleAuthzUnauthorizedExtAuthz` | `handler_authz_impl_extauthz.go:36-61` | Envoy |
+
+---
+
+### 8.3 触发条件详细对比表
+
+| 场景条件 | Legacy | AuthRequest | ForwardAuth | ExtAuthz |
+|---------|--------|-------------|-------------|----------|
+| **AuthnTypeAuthorization (Basic/Bearer)** | `401` + **WWW-Authenticate: Basic** | 无此分支 | 无此分支 | 无此分支 |
+| **XHR 请求 (XMLHttpRequest)** | `401` + Location | `401` + Location | `401` + Location | `401` + Location |
+| **不接受 text/html (Accept 头部)** | `401` + Location | `401` + Location | `401` + Location | `401` + Location |
+| **无 redirectionURL** | `401` (无 Location, 纯 401) | `401` + Location | N/A (有 URL) | N/A (有 URL) |
+| **GET/OPTIONS/HEAD + 浏览器** | `302 Found` + Location | `401` + Location | `302 Found` + Location | `302 Found` + Location |
+| **POST/PUT/DELETE + 浏览器** | `303 See Other` + Location | `401` + Location | `303 See Other` + Location | `303 See Other` + Location |
+| **HEAD 请求 (body 处理)** | SpecialRedirectNoBody | SpecialRedirectNoBody | SpecialRedirectNoBody | SpecialRedirectNoBody |
+| **WWW-Authenticate 头部** | ✅ **仅 Basic Auth 场景** | ❌ 从不设置 | ❌ 从不设置 | ❌ 从不设置 |
+
+---
+
+### 8.4 各实现核心代码分析
+
+#### 8.4.1 Legacy 实现（唯一带 WWW-Authenticate）
+
+**文件位置**: `handler_authz_impl_legacy.go:34-70`
 
 ```go
 func handleAuthzUnauthorizedLegacy(ctx, authn, redirectionURL) {
-    // 1. 如果是 Authorization 头部请求（Basic/Bearer）→ 401 + WWW-Authenticate
+    // 🔑 唯一有 WWW-Authenticate 挑战的分支
     if authn.Type == AuthnTypeAuthorization {
-        handleAuthzUnauthorizedAuthorizationBasic(ctx, authn)
+        handleAuthzUnauthorizedAuthorizationBasic(ctx, authn)  // 401 + WWW-Authenticate
         return
     }
 
-    // 2. 决定状态码
+    // 状态码选择
     switch {
-    // XHR 请求 / 不接受 HTML / 无重定向 URL → 401
     case ctx.IsXHR() || !ctx.AcceptsMIME("text/html") || redirectionURL == nil:
-        statusCode = fasthttp.StatusUnauthorized
-    // GET/OPTIONS/HEAD 请求 → 302 Found (临时重定向)
-    case authn.Object.Method == GET/OPTIONS/HEAD/"":
-        statusCode = fasthttp.StatusFound
-    // 其他方法 (POST/PUT/DELETE 等) → 303 See Other
+        statusCode = 401
     default:
-        statusCode = fasthttp.StatusSeeOther
+        switch authn.Object.Method {
+        case GET/OPTIONS/HEAD/"":
+            statusCode = 302  // Found
+        default:
+            statusCode = 303  // See Other
+        }
     }
 
-    // 3. 执行重定向或返回 401
     if redirectionURL != nil {
-        // 执行重定向
-        ctx.SpecialRedirect(redirectionURL.String(), statusCode)
+        ctx.SpecialRedirect(redirectionURL.String(), statusCode)  // 带 Location 头
     } else {
-        // 无重定向 URL → 返回 401
-        ctx.ReplyUnauthorized()
+        ctx.ReplyUnauthorized()  // 纯 401，无重定向
     }
 }
 ```
 
-### 8.2 触发条件详细对比
-
-| 条件 | 响应码 | 场景说明 |
-|------|--------|----------|
-| **Authorization 头部存在** | `401 Unauthorized` | API 调用、脚本访问 |
-| **X-Requested-With: XMLHttpRequest** | `401 Unauthorized` | AJAX 请求 |
-| **Accept 不含 text/html** | `401 Unauthorized` | 非浏览器请求 |
-| **无 redirectionURL** | `401 Unauthorized` | 无法确定门户地址 |
-| **GET/OPTIONS/HEAD + 浏览器** | `302 Found` | 用户直接访问受保护资源 |
-| **POST/PUT/DELETE + 浏览器** | `303 See Other` | 表单提交后重定向到登录 |
-
-### 8.3 WWW-Authenticate 挑战响应
-
-**文件位置**: `internal/handlers/handler_authz_common.go:78-84`
-
+**WWW-Authenticate 设置代码** (`handler_authz_common.go:78-84`):
 ```go
 func handleAuthzUnauthorizedAuthorizationBasic(ctx, authn) {
     ctx.ReplyUnauthorized()  // 401
-    ctx.Response.Header.SetBytesKV(
-        headerWWWAuthenticate,
-        headerValueAuthenticateBasic  // "Basic realm="Authelia""
-    )
+    ctx.Response.Header.SetBytesKV(headerWWWAuthenticate, headerValueAuthenticateBasic)
+    // 结果: WWW-Authenticate: Basic realm="Authelia"
 }
 ```
 
-**响应示例**:
+#### 8.4.2 AuthRequest 实现（统一 401）
+
+**文件位置**: `handler_authz_impl_authrequest.go:39-48`
+
+```go
+func handleAuthzUnauthorizedAuthRequest(ctx, authn, redirectionURL) {
+    // ❌ 没有 WWW-Authenticate 分支
+    // ❌ 没有状态码选择逻辑，强制 401
+
+    switch authn.Object.Method {
+    case HEAD:
+        ctx.SpecialRedirectNoBody(redirectionURL.String(), 401)
+    default:
+        ctx.SpecialRedirect(redirectionURL.String(), 401)
+    }
+    // 结果: 401 + Location 重定向头（HTML body 带链接）
+}
+```
+
+**特点**:
+- 所有情况统一返回 `401 Unauthorized`
+- 始终设置 `Location` 头指向登录门户
+- **从不设置 WWW-Authenticate**
+- Nginx auth_request 模块期望这种行为
+
+#### 8.4.3 ForwardAuth 实现（智能选择）
+
+**文件位置**: `handler_authz_impl_forwardauth.go:36-61`
+
+```go
+func handleAuthzUnauthorizedForwardAuth(ctx, authn, redirectionURL) {
+    // ❌ 没有 WWW-Authenticate 分支
+
+    switch {
+    case ctx.IsXHR() || !ctx.AcceptsMIME("text/html"):
+        statusCode = 401  // API 场景
+    default:
+        switch authn.Object.Method {
+        case GET/OPTIONS/HEAD:
+            statusCode = 302  // Found
+        default:
+            statusCode = 303  // See Other
+        }
+    }
+
+    ctx.SpecialRedirect(redirectionURL.String(), statusCode)
+}
+```
+
+**特点**:
+- 智能区分浏览器与非浏览器场景
+- 浏览器 GET → 302 临时重定向
+- 浏览器 POST → 303 See Other（防重复提交）
+- API 场景 → 401（带 Location）
+- **从不设置 WWW-Authenticate**
+
+#### 8.4.4 ExtAuthz 实现（同 ForwardAuth）
+
+**文件位置**: `handler_authz_impl_extauthz.go:36-61`
+
+```go
+// 代码与 ForwardAuth 完全相同
+func handleAuthzUnauthorizedExtAuthz(ctx, authn, redirectionURL) {
+    switch {
+    case ctx.IsXHR() || !ctx.AcceptsMIME("text/html"):
+        statusCode = 401
+    default:
+        switch authn.Object.Method {
+        case GET/OPTIONS/HEAD:
+            statusCode = 302
+        default:
+            statusCode = 303
+        }
+    }
+    ctx.SpecialRedirect(redirectionURL.String(), statusCode)
+}
+```
+
+**特点**:
+- 与 ForwardAuth 逻辑完全一致
+- 为 Envoy 外部认证设计
+- **从不设置 WWW-Authenticate**
+
+---
+
+### 8.5 SpecialRedirect 机制解析
+
+**文件位置**: `middlewares/authelia_context.go:587-621`
+
+```go
+func (ctx *AutheliaCtx) SpecialRedirect(uri string, statusCode int) {
+    u, statusCode = ctx.setSpecialRedirect(uri, statusCode)
+
+    ctx.SetContentTypeTextHTML()
+    ctx.SetBodyString(fmt.Sprintf("<a href=\"%s\">%d %s</a>", ...))
+}
+
+func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) {
+    // 验证状态码合法性，非法则强制改为 302
+    if statusCode < 301 || (statusCode > 303 && statusCode != 307 && statusCode != 308 && statusCode != 401) {
+        statusCode = 302
+    }
+
+    ctx.SetStatusCode(statusCode)
+    ctx.Response.Header.SetBytesKV(headerLocation, raw)  // 设置 Location 头
+}
+```
+
+**关键特性**:
+- 允许 `401` 作为重定向状态码（非标准但代理支持）
+- 非法状态码自动降级为 `302 Found`
+- 始终设置 `Location` 响应头
+- HTML body 包含可点击的链接（非 HEAD 请求）
+
+---
+
+### 8.6 响应示例对比
+
+#### Legacy - Basic Auth 场景（唯一带挑战头）
 ```http
 HTTP/1.1 401 Unauthorized
 WWW-Authenticate: Basic realm="Authelia"
@@ -698,21 +833,43 @@ Content-Type: text/plain; charset=utf-8
 401 Unauthorized
 ```
 
-### 8.4 浏览器重定向流程
+#### AuthRequest - 所有场景（401 + Location）
+```http
+HTTP/1.1 401 Unauthorized
+Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
+Content-Type: text/html; charset=utf-8
 
-**重定向 URL 构建**:
-```go
-redirectionURL = autheliaPortalURL + "?rd=" + urlEncode(targetURL)
+<a href="https://auth.example.com/?rd=...">401 Unauthorized</a>
 ```
 
-**重定向日志**:
-```
-time="..." level=info msg="Access to 'https://app.example.com/private' (method GET) is not authorized to user anonymous, redirecting to status code 302 location https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com%2Fprivate"
+#### ForwardAuth/ExtAuthz - 浏览器 GET（302 重定向）
+```http
+HTTP/1.1 302 Found
+Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
+Content-Type: text/html; charset=utf-8
+
+<a href="https://auth.example.com/?rd=...">302 Found</a>
 ```
 
-**302 vs 303 选择原因**:
-- **302 Found**: 用于 GET 请求，保持原方法重定向
-- **303 See Other**: 用于 POST/PUT 等非幂等操作，强制改为 GET 方法防止重复提交
+#### ForwardAuth/ExtAuthz - API 场景（401 + Location）
+```http
+HTTP/1.1 401 Unauthorized
+Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
+Content-Type: text/html; charset=utf-8
+
+<a href="https://auth.example.com/?rd=...">401 Unauthorized</a>
+```
+
+---
+
+### 8.7 设计意图与适用场景
+
+| 实现 | 设计理念 | 适用代理 | 推荐场景 |
+|-----|---------|---------|---------|
+| **Legacy** | 完整 HTTP 语义，支持 Basic Auth 挑战 | Traefik v1, Nginx | 需要支持浏览器 Basic Auth 弹窗 |
+| **AuthRequest** | Nginx 模块兼容，统一 401 处理 | Nginx | Nginx auth_request 模块 |
+| **ForwardAuth** | Traefik 兼容，智能区分浏览器/API | Traefik v2+ | 现代部署，兼顾用户体验与 API |
+| **ExtAuthz** | Envoy 服务网格兼容 | Envoy, Istio | 服务网格架构 |
 
 ---
 
@@ -726,9 +883,10 @@ time="..." level=info msg="Access to 'https://app.example.com/private' (method G
     │
     ▼
 1. 解析目标对象 (Object)
-   ├─ X-Original-URL / X-Forwarded-* 头部
-   ├─ 验证 URL Scheme 必须是 https
-   └─ 提取 Domain、URL、Method
+   ├─ Legacy: X-Original-URL / X-Forwarded-*
+   ├─ AuthRequest: X-Original-URL + X-Original-Method
+   ├─ ForwardAuth: X-Forwarded-*
+   └─ ExtAuthz: X-Forwarded-* + Host + Path
     │
     ▼
 2. 获取 Session Provider
@@ -759,18 +917,20 @@ time="..." level=info msg="Access to 'https://app.example.com/private' (method G
    └─ isAuthzResult(actual, required, hasSubjects)
     │
     ▼
-7. 生成最终响应
+7. 生成最终响应（视实现而定）
    ├─ Authorized (200)
-   │  └─ 附加 Remote-User/Remote-Groups/Remote-Name/Remote-Email 头部
-   ├─ Unauthorized
-   │  ├─ API/AJAX → 401 + WWW-Authenticate
-   │  └─ 浏览器 → 302/303 重定向到登录门户
+   │  └─ Remote-User/Remote-Groups/Remote-Name/Remote-Email
+   ├─ Unauthorized（四种实现差异）
+   │  ├─ Legacy: 302/303/401 (+ WWW-Authenticate 仅 Basic Auth)
+   │  ├─ AuthRequest: 统一 401 + Location
+   │  ├─ ForwardAuth: 302/303/401 + Location
+   │  └─ ExtAuthz: 302/303/401 + Location
    └─ Forbidden (403)
     │
     ▼
 [反向代理] 根据响应决定
    ├─ 200 → 转发请求到后端
-   ├─ 302 → 转发重定向到用户浏览器
+   ├─ 302/303 → 转发重定向到用户浏览器
    └─ 401/403 → 返回错误给用户
 ```
 
@@ -810,7 +970,12 @@ time="..." level=info msg="Access to 'https://app.example.com/private' (method G
 | Header 策略 | `internal/handlers/handler_authz_authn.go:165-254` | `HeaderAuthnStrategy.Get()` |
 | 授权主处理器 | `internal/handlers/handler_authz.go:15-110` | `Authz.Handler()` |
 | 授权决策器 | `internal/authorization/authorizer.go` | `Authorizer.GetRequiredLevel()` |
-| 未授权响应 | `internal/handlers/handler_authz_impl_legacy.go:34-69` | `handleAuthzUnauthorizedLegacy()` |
+| Legacy 未授权 | `internal/handlers/handler_authz_impl_legacy.go:34-70` | `handleAuthzUnauthorizedLegacy()` |
+| AuthRequest 未授权 | `internal/handlers/handler_authz_impl_authrequest.go:39-48` | `handleAuthzUnauthorizedAuthRequest()` |
+| ForwardAuth 未授权 | `internal/handlers/handler_authz_impl_forwardauth.go:36-61` | `handleAuthzUnauthorizedForwardAuth()` |
+| ExtAuthz 未授权 | `internal/handlers/handler_authz_impl_extauthz.go:36-61` | `handleAuthzUnauthorizedExtAuthz()` |
+| WWW-Authenticate 设置 | `internal/handlers/handler_authz_common.go:78-84` | `handleAuthzUnauthorizedAuthorizationBasic()` |
+| SpecialRedirect | `internal/middlewares/authelia_context.go:587-621` | `SpecialRedirect()` |
 | 要求认证中间件 | `internal/middlewares/require_auth.go` | `Require1FA()`, `RequireElevated()` |
 
 ---
@@ -831,6 +996,7 @@ time="..." level=info msg="Access to 'https://app.example.com/private' (method G
 3. **异步组解析**: 大型部署中组查询可能成为瓶颈
 4. **预取策略**: 根据访问模式预测性加载用户数据
 5. **多 Provider 支持**: 同时支持 File + LDAP 作为后备
+6. **AuthRequest 增加 WWW-Authenticate**: 为 API 场景提供更好的 Basic Auth 支持
 
 ---
 
