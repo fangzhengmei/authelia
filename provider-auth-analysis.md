@@ -628,55 +628,196 @@ case AuthzResultForbidden:      // 403
 
 ## 八、四种授权实现：未授权响应详细对比
 
-### 8.1 概述
+### 8.1 两层未授权处理架构
 
-⚠️ **重要修正**: 之前结论"401 都带 WWW-Authenticate 挑战头"是错误的。
+Authelia 采用**两级未授权处理机制**，两者是 **OR 关系**（触发其一即可）：
 
-**正确结论**: **只有 Legacy 实现在 Authorization 头部认证场景下才会设置 WWW-Authenticate 头部**。其他三种实现（AuthRequest、ForwardAuth、ExtAuthz）的 401 响应仅带 Location 重定向头，**不会设置 WWW-Authenticate**。
+| 层级 | 触发时机 | 处理函数 |
+|------|---------|---------|
+| **策略级 (Strategy-level)** | `strategy.Get()` 返回 `err` 时触发 | `strategy.HandleUnauthorized()` |
+| **实现级 (Implementation-level)** | 认证级别不足（`isAuthzResult` 返回 Unauthorized）时触发 | `handleAuthzUnauthorizedXXX()` |
 
----
-
-### 8.2 四种实现代码位置
-
-| 实现方式 | 处理函数 | 文件位置 | 适用反向代理 |
-|---------|---------|---------|-------------|
-| **Legacy** | `handleAuthzUnauthorizedLegacy` | `handler_authz_impl_legacy.go:34-70` | Traefik v1, Nginx |
-| **AuthRequest** | `handleAuthzUnauthorizedAuthRequest` | `handler_authz_impl_authrequest.go:39-48` | Nginx auth_request |
-| **ForwardAuth** | `handleAuthzUnauthorizedForwardAuth` | `handler_authz_impl_forwardauth.go:36-61` | Traefik v2+ |
-| **ExtAuthz** | `handleAuthzUnauthorizedExtAuthz` | `handler_authz_impl_extauthz.go:36-61` | Envoy |
+⚠️ **重要修正**: 
+1. 之前结论"401 都带 WWW-Authenticate 挑战头"是错误的。
+2. **策略级处理优先级更高**：如策略级触发并返回，实现级不再执行。
 
 ---
 
-### 8.3 触发条件详细对比表
+### 8.2 策略级未授权处理：从 err 分流切入
 
-| 场景条件 | Legacy | AuthRequest | ForwardAuth | ExtAuthz |
-|---------|--------|-------------|-------------|----------|
-| **AuthnTypeAuthorization (Basic/Bearer)** | `401` + **WWW-Authenticate: Basic** | 无此分支 | 无此分支 | 无此分支 |
-| **XHR 请求 (XMLHttpRequest)** | `401` + Location | `401` + Location | `401` + Location | `401` + Location |
-| **不接受 text/html (Accept 头部)** | `401` + Location | `401` + Location | `401` + Location | `401` + Location |
-| **无 redirectionURL** | `401` (无 Location, 纯 401) | `401` + Location | N/A (有 URL) | N/A (有 URL) |
-| **GET/OPTIONS/HEAD + 浏览器** | `302 Found` + Location | `401` + Location | `302 Found` + Location | `302 Found` + Location |
-| **POST/PUT/DELETE + 浏览器** | `303 See Other` + Location | `401` + Location | `303 See Other` + Location | `303 See Other` + Location |
-| **HEAD 请求 (body 处理)** | SpecialRedirectNoBody | SpecialRedirectNoBody | SpecialRedirectNoBody | SpecialRedirectNoBody |
-| **WWW-Authenticate 头部** | ✅ **仅 Basic Auth 场景** | ❌ 从不设置 | ❌ 从不设置 | ❌ 从不设置 |
+#### 8.2.1 触发入口代码
+
+**文件位置**: `handler_authz.go:59-91`
+
+```go
+// 🔑 认证策略执行
+authn, strategy, err = authz.authn(ctx, provider, &object)
+
+// ... 计算授权级别 ...
+
+// 🔑 err 分流：策略级未授权处理入口
+if err != nil {
+    authn.Object = object
+
+    // 前置条件：规则无用户限制 && 策略不是 Bypass
+    if !ruleHasSubject && required != authorization.Bypass {
+        switch {
+        case strategy == nil:
+            ctx.ReplyUnauthorized()  // 兜底：纯 401
+        case strategy.HeaderStrategy():
+            // ✅ 触发策略级未授权处理
+            strategy.HandleUnauthorized(ctx, authn, redirectionURL)
+            return  // 🚨 直接返回，不再走实现级处理
+        }
+    }
+}
+
+// ⬇️ 只有策略级未触发时，才走到实现级处理
+switch isAuthzResult(...) {
+case AuthzResultUnauthorized:
+    handler = strategy.HandleUnauthorized  // 或实现级 handler
+    handler(ctx, authn, redirectionURL)
+}
+```
+
+#### 8.2.2 `authn` 函数中的策略标记逻辑
+
+**文件位置**: `handler_authz.go:160-186`
+
+```go
+func (authz *Authz) authn(...) (authn *Authn, strategy AuthnStrategy, err error) {
+    for _, strategy = range authz.strategies {
+        if authn, err = strategy.Get(ctx, provider, object); err != nil {
+            // 认证出错，降级为未认证
+            authn.Level = authentication.NotAuthenticated
+            
+            // 🔑 关键：标记该策略是否能处理未授权
+            if strategy.CanHandleUnauthorized() {
+                return authn, strategy, err  // 返回策略，供上层调用
+            }
+            return authn, nil, err  // 不能处理，置空 strategy
+        }
+        // ...
+    }
+    
+    // 遍历完所有策略后的最终标记
+    if strategy.CanHandleUnauthorized() {
+        return authn, strategy, err
+    }
+    return authn, nil, nil
+}
+```
+
+#### 8.2.3 策略级处理触发条件（全部满足）
+
+| 条件 | 说明 |
+|------|------|
+| ✅ `err != nil` | 策略 `Get()` 方法返回错误 |
+| ✅ `!ruleHasSubject` | 匹配的访问控制规则无用户/组限制 |
+| ✅ `required != Bypass` | 策略不是 Bypass（需要认证） |
+| ✅ `strategy != nil` | 策略对象存在 |
+| ✅ `strategy.HeaderStrategy()` | 是头部策略（Cookie 策略不处理） |
+| ✅ `strategy.CanHandleUnauthorized()` | 策略自己声明能处理未授权 |
 
 ---
 
-### 8.4 各实现核心代码分析
+### 8.3 四种实现的默认策略差异
 
-#### 8.4.1 Legacy 实现（唯一带 WWW-Authenticate）
+#### 8.3.1 三种 HeaderAuthnStrategy 工厂函数对比
+
+**文件位置**: `handler_authz_authn.go:37-78`
+
+| 策略工厂函数 | 适用实现 | `statusAuthenticate` | `headerAuthenticate` |
+|-------------|---------|---------------------|---------------------|
+| `NewHeaderAuthorizationAuthnStrategy` | Legacy (Authorization 头) | `401 Unauthorized` | `WWW-Authenticate` |
+| `NewHeaderProxyAuthorizationAuthnStrategy` | **ForwardAuth, ExtAuthz** | `407 Proxy Auth Required` | `Proxy-Authenticate` |
+| `NewHeaderProxyAuthorizationAuthRequestAuthnStrategy` | **AuthRequest** | `401 Unauthorized` | `WWW-Authenticate` |
+
+#### 8.3.2 实现与默认策略绑定关系
+
+**文件位置**: `handler_authz_builder.go:120-126`
+
+```go
+switch b.implementation {
+case AuthzImplLegacy, AuthzImplAuthRequest:
+    // Legacy + AuthRequest：用 AuthRequest 专用策略（401 + WWW-Authenticate）
+    authz.strategies = []AuthnStrategy{
+        NewHeaderProxyAuthorizationAuthRequestAuthnStrategy(...),
+        NewCookieSessionAuthnStrategy(...),
+    }
+default:
+    // ForwardAuth + ExtAuthz：用标准 Proxy 策略（407 + Proxy-Authenticate）
+    authz.strategies = []AuthnStrategy{
+        NewHeaderProxyAuthorizationAuthnStrategy(...),
+        NewCookieSessionAuthnStrategy(...),
+    }
+}
+```
+
+#### 8.3.3 策略级 HandleUnauthorized 核心实现
+
+**文件位置**: `handler_authz_authn.go:354-365`
+
+```go
+func (s *HeaderAuthnStrategy) HandleUnauthorized(ctx, authn, redirectionURL) {
+    ctx.ReplyStatusCode(s.statusAuthenticate)  // 用策略配置的状态码
+    
+    // Bearer token 错误场景（如 scope 不足）
+    if authn.Header.Authorization.Scheme == Bearer && authn.Header.Error != nil {
+        ctx.Response.Header.SetBytesK(s.headerAuthenticate, 
+            fmt.Sprintf(`Bearer %s`, RFC6750Header(...)))
+    // Basic auth 场景
+    } else if s.headerAuthenticate != nil {
+        ctx.Response.Header.SetBytesKV(s.headerAuthenticate, headerValueAuthenticateBasic)
+    }
+    // 注意：❌ 从不设置 Location 重定向头
+}
+```
+
+---
+
+### 8.4 四种实现完整对比表
+
+| 维度 | Legacy | AuthRequest | ForwardAuth | ExtAuthz |
+|-----|--------|-------------|-------------|----------|
+| **适用反向代理** | Traefik v1, Nginx | Nginx auth_request | Traefik v2+ | Envoy, Istio |
+| **默认 Header 策略** | HeaderLegacyAuthnStrategy | HeaderProxyAuthorizationAuthRequestAuthnStrategy | HeaderProxyAuthorizationAuthnStrategy | HeaderProxyAuthorizationAuthnStrategy |
+| **策略级状态码** | `401` | `401` | **`407 Proxy Auth Required`** | **`407 Proxy Auth Required`** |
+| **策略级响应头** | `WWW-Authenticate` | `WWW-Authenticate` | **`Proxy-Authenticate`** | **`Proxy-Authenticate`** |
+| **策略级 Location 头** | ❌ 从不 | ❌ 从不 | ❌ 从不 | ❌ 从不 |
+| **实现级 302/303 支持** | ✅ | ❌ 永远 401 | ✅ | ✅ |
+| **实现级 Location 头** | ✅ | ✅ | ✅ | ✅ |
+| **实现级重定向 body** | ✅ | ✅ | ✅ | ✅ |
+| **AuthnTypeAuthorization 分支** | ✅ 唯一有此分支 | ❌ 无 | ❌ 无 | ❌ 无 |
+
+---
+
+### 8.5 四种实现代码位置索引
+
+| 实现方式 | 实现级处理函数 | 策略级默认策略 | 文件位置 |
+|---------|---------------|---------------|---------|
+| **Legacy** | `handleAuthzUnauthorizedLegacy` | `HeaderLegacyAuthnStrategy` | `handler_authz_impl_legacy.go:34-70` |
+| **AuthRequest** | `handleAuthzUnauthorizedAuthRequest` | `NewHeaderProxyAuthorizationAuthRequestAuthnStrategy` | `handler_authz_impl_authrequest.go:39-48` |
+| **ForwardAuth** | `handleAuthzUnauthorizedForwardAuth` | `NewHeaderProxyAuthorizationAuthnStrategy` | `handler_authz_impl_forwardauth.go:36-61` |
+| **ExtAuthz** | `handleAuthzUnauthorizedExtAuthz` | `NewHeaderProxyAuthorizationAuthnStrategy` | `handler_authz_impl_extauthz.go:36-61` |
+
+---
+
+### 8.6 各实现级核心代码分析
+
+#### 8.6.1 Legacy 实现（最复杂，含双重处理）
 
 **文件位置**: `handler_authz_impl_legacy.go:34-70`
 
 ```go
 func handleAuthzUnauthorizedLegacy(ctx, authn, redirectionURL) {
-    // 🔑 唯一有 WWW-Authenticate 挑战的分支
+    // 🔑 唯一有 Authorization 头部特殊分支
     if authn.Type == AuthnTypeAuthorization {
         handleAuthzUnauthorizedAuthorizationBasic(ctx, authn)  // 401 + WWW-Authenticate
         return
     }
 
-    // 状态码选择
+    // 状态码智能选择
     switch {
     case ctx.IsXHR() || !ctx.AcceptsMIME("text/html") || redirectionURL == nil:
         statusCode = 401
@@ -690,7 +831,7 @@ func handleAuthzUnauthorizedLegacy(ctx, authn, redirectionURL) {
     }
 
     if redirectionURL != nil {
-        ctx.SpecialRedirect(redirectionURL.String(), statusCode)  // 带 Location 头
+        ctx.SpecialRedirect(redirectionURL.String(), statusCode)  // 带 Location + HTML body
     } else {
         ctx.ReplyUnauthorized()  // 纯 401，无重定向
     }
@@ -706,14 +847,14 @@ func handleAuthzUnauthorizedAuthorizationBasic(ctx, authn) {
 }
 ```
 
-#### 8.4.2 AuthRequest 实现（统一 401）
+#### 8.6.2 AuthRequest 实现（统一 401，最简单）
 
 **文件位置**: `handler_authz_impl_authrequest.go:39-48`
 
 ```go
 func handleAuthzUnauthorizedAuthRequest(ctx, authn, redirectionURL) {
-    // ❌ 没有 WWW-Authenticate 分支
-    // ❌ 没有状态码选择逻辑，强制 401
+    // ❌ 无 WWW-Authenticate 分支
+    // ❌ 无状态码选择逻辑，强制 401
 
     switch authn.Object.Method {
     case HEAD:
@@ -721,23 +862,23 @@ func handleAuthzUnauthorizedAuthRequest(ctx, authn, redirectionURL) {
     default:
         ctx.SpecialRedirect(redirectionURL.String(), 401)
     }
-    // 结果: 401 + Location 重定向头（HTML body 带链接）
+    // 结果: 401 + Location 重定向头 + HTML body
 }
 ```
 
 **特点**:
 - 所有情况统一返回 `401 Unauthorized`
 - 始终设置 `Location` 头指向登录门户
-- **从不设置 WWW-Authenticate**
-- Nginx auth_request 模块期望这种行为
+- 仅实现级处理，策略级只在 Basic auth 出错时触发
+- 兼容 Nginx auth_request 模块行为
 
-#### 8.4.3 ForwardAuth 实现（智能选择）
+#### 8.6.3 ForwardAuth 实现（智能选择状态码）
 
 **文件位置**: `handler_authz_impl_forwardauth.go:36-61`
 
 ```go
 func handleAuthzUnauthorizedForwardAuth(ctx, authn, redirectionURL) {
-    // ❌ 没有 WWW-Authenticate 分支
+    // ❌ 无 WWW-Authenticate 分支
 
     switch {
     case ctx.IsXHR() || !ctx.AcceptsMIME("text/html"):
@@ -760,14 +901,14 @@ func handleAuthzUnauthorizedForwardAuth(ctx, authn, redirectionURL) {
 - 浏览器 GET → 302 临时重定向
 - 浏览器 POST → 303 See Other（防重复提交）
 - API 场景 → 401（带 Location）
-- **从不设置 WWW-Authenticate**
+- 策略级用 407 + Proxy-Authenticate
 
-#### 8.4.4 ExtAuthz 实现（同 ForwardAuth）
+#### 8.6.4 ExtAuthz 实现（同 ForwardAuth）
 
 **文件位置**: `handler_authz_impl_extauthz.go:36-61`
 
 ```go
-// 代码与 ForwardAuth 完全相同
+// 代码与 ForwardAuth 完全一致
 func handleAuthzUnauthorizedExtAuthz(ctx, authn, redirectionURL) {
     switch {
     case ctx.IsXHR() || !ctx.AcceptsMIME("text/html"):
@@ -785,13 +926,13 @@ func handleAuthzUnauthorizedExtAuthz(ctx, authn, redirectionURL) {
 ```
 
 **特点**:
-- 与 ForwardAuth 逻辑完全一致
-- 为 Envoy 外部认证设计
-- **从不设置 WWW-Authenticate**
+- 与 ForwardAuth 实现级逻辑 100% 相同
+- 策略级同样用 407 + Proxy-Authenticate
+- 专为 Envoy 外部认证过滤器设计
 
 ---
 
-### 8.5 SpecialRedirect 机制解析
+### 8.7 SpecialRedirect 机制解析
 
 **文件位置**: `middlewares/authelia_context.go:587-621`
 
@@ -804,27 +945,27 @@ func (ctx *AutheliaCtx) SpecialRedirect(uri string, statusCode int) {
 }
 
 func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) {
-    // 验证状态码合法性，非法则强制改为 302
+    // 状态码合法性校验，非法则强制降级为 302
     if statusCode < 301 || (statusCode > 303 && statusCode != 307 && statusCode != 308 && statusCode != 401) {
         statusCode = 302
     }
 
     ctx.SetStatusCode(statusCode)
-    ctx.Response.Header.SetBytesKV(headerLocation, raw)  // 设置 Location 头
+    ctx.Response.Header.SetBytesKV(headerLocation, raw)  // 必定设置 Location 头
 }
 ```
 
 **关键特性**:
 - 允许 `401` 作为重定向状态码（非标准但代理支持）
-- 非法状态码自动降级为 `302 Found`
-- 始终设置 `Location` 响应头
-- HTML body 包含可点击的链接（非 HEAD 请求）
+- `407` 不在白名单中 → 策略级用纯 ReplyStatusCode
+- 合法状态码自动降级为 `302 Found`
+- HTML body 包含可点击链接（非 HEAD 请求）
 
 ---
 
-### 8.6 响应示例对比
+### 8.8 响应示例对比
 
-#### Legacy - Basic Auth 场景（唯一带挑战头）
+#### Legacy 策略级 - Basic Auth 认证失败
 ```http
 HTTP/1.1 401 Unauthorized
 WWW-Authenticate: Basic realm="Authelia"
@@ -833,7 +974,16 @@ Content-Type: text/plain; charset=utf-8
 401 Unauthorized
 ```
 
-#### AuthRequest - 所有场景（401 + Location）
+#### ForwardAuth/ExtAuthz 策略级 - Proxy Auth 失败
+```http
+HTTP/1.1 407 Proxy Authentication Required
+Proxy-Authenticate: Basic realm="Authelia"
+Content-Type: text/plain; charset=utf-8
+
+407 Proxy Authentication Required
+```
+
+#### AuthRequest 实现级 - 浏览器访问
 ```http
 HTTP/1.1 401 Unauthorized
 Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
@@ -842,7 +992,7 @@ Content-Type: text/html; charset=utf-8
 <a href="https://auth.example.com/?rd=...">401 Unauthorized</a>
 ```
 
-#### ForwardAuth/ExtAuthz - 浏览器 GET（302 重定向）
+#### ForwardAuth/ExtAuthz 实现级 - 浏览器 GET
 ```http
 HTTP/1.1 302 Found
 Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
@@ -851,25 +1001,16 @@ Content-Type: text/html; charset=utf-8
 <a href="https://auth.example.com/?rd=...">302 Found</a>
 ```
 
-#### ForwardAuth/ExtAuthz - API 场景（401 + Location）
-```http
-HTTP/1.1 401 Unauthorized
-Location: https://auth.example.com/?rd=https%3A%2F%2Fapp.example.com
-Content-Type: text/html; charset=utf-8
-
-<a href="https://auth.example.com/?rd=...">401 Unauthorized</a>
-```
-
 ---
 
-### 8.7 设计意图与适用场景
+### 8.9 设计意图总结
 
-| 实现 | 设计理念 | 适用代理 | 推荐场景 |
+| 实现 | 代理兼容 | 设计理念 | 推荐场景 |
 |-----|---------|---------|---------|
-| **Legacy** | 完整 HTTP 语义，支持 Basic Auth 挑战 | Traefik v1, Nginx | 需要支持浏览器 Basic Auth 弹窗 |
-| **AuthRequest** | Nginx 模块兼容，统一 401 处理 | Nginx | Nginx auth_request 模块 |
-| **ForwardAuth** | Traefik 兼容，智能区分浏览器/API | Traefik v2+ | 现代部署，兼顾用户体验与 API |
-| **ExtAuthz** | Envoy 服务网格兼容 | Envoy, Istio | 服务网格架构 |
+| **Legacy** | Traefik v1, Nginx | 完整 HTTP 语义，支持 WWW-Authenticate | 需浏览器 Basic Auth 弹窗场景 |
+| **AuthRequest** | Nginx | Nginx 模块兼容，统一 401 行为 | Nginx auth_request 标准集成 |
+| **ForwardAuth** | Traefik v2+ | 智能区分浏览器/API，最佳用户体验 | Traefik 现代部署 |
+| **ExtAuthz** | Envoy, Istio | 服务网格外部认证标准 | Kubernetes + Istio 架构 |
 
 ---
 
