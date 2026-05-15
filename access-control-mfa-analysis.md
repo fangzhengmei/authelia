@@ -851,7 +851,226 @@ identity_providers:
 
 ---
 
-## 11. 文件位置索引
+## 11. OIDC 用户令牌与客户端凭证令牌的 Subject 回填差异
+
+### 11.1 内省后的字段回填差异
+
+**核心代码位置**: `internal/handlers/handler_authz_authn.go:handleVerifyGETAuthorizationBearerIntrospection`
+
+两种令牌类型在 Token 内省后的字段回填逻辑有本质差异：
+
+```go
+if osession.ClientCredentials {
+    // 客户端凭证模式 (Client Credentials)
+    return "", osession.ClientID, true, authentication.OneFactor, nil
+}
+
+// 用户令牌模式 (Authorization Code / Implicit)
+if authorization.NewAuthenticationMethodsReferencesFromClaim(
+    osession.DefaultSession.Claims.AuthenticationMethodsReferences,
+).MultiFactorAuthentication() {
+    level = authentication.TwoFactor
+} else {
+    level = authentication.OneFactor
+}
+
+return osession.Username, "", false, level, nil
+```
+
+**回填差异对比表**:
+
+| 字段 | 用户令牌 (User Token) | 客户端凭证令牌 (Client Credentials) |
+|-----|----------------------|-----------------------------------|
+| username | `osession.Username` (非空，实际用户名) | `""` (空字符串) |
+| clientID | `""` (空字符串) | `osession.ClientID` (非空，客户端 ID) |
+| ccs | `false` | `true` |
+| level | 根据 amr 判定：OneFactor/TwoFactor | 固定 OneFactor |
+| Groups | 用户所属的用户组 (从用户详情加载) | 空数组 |
+
+**关键数据结构**:
+```go
+// 最终传递给访问控制的 Subject
+type Subject struct {
+    Username string   // 用户令牌：有值；客户端凭证：空
+    Groups   []string // 用户令牌：用户组；客户端凭证：空
+    ClientID string   // 用户令牌：空；客户端凭证：有值
+    IP       net.IP
+}
+```
+
+### 11.2 oauth2:client 规则命中机制
+
+**规则匹配代码**: `internal/authorization/access_control_subjects.go:AccessControlClient.IsMatch`
+
+```go
+// AccessControlClient represents an ACL subject of type `oauth2:client:`.
+type AccessControlClient struct {
+    Provider string
+    ID       string
+}
+
+func (acc AccessControlClient) IsMatch(subject Subject) bool {
+    return acc.ID == subject.ClientID
+}
+```
+
+**命中条件分析**:
+
+1. **客户端凭证令牌 → 可以命中 oauth2:client 规则**
+   ```yaml
+   access_control:
+     rules:
+       - domain: api.example.com
+         subject: ["oauth2:client:backend-service"]
+         policy: one_factor
+   ```
+   - ClientID 回填为 `backend-service`
+   - `acc.ID == subject.ClientID` → `"backend-service" == "backend-service"` → **匹配 ✓**
+
+2. **用户令牌 → 无法命中 oauth2:client 规则**
+   - ClientID 回填为空字符串
+   - `acc.ID == subject.ClientID` → `"backend-service" == ""` → **不匹配 ✗**
+
+**规则匹配矩阵**:
+
+| 令牌类型 | oauth2:client:xxx 规则 | user:xxx 规则 | group:xxx 规则 |
+|---------|-----------------------|--------------|---------------|
+| 用户令牌 | ✗ 不匹配 (ClientID 为空) | ✓ 可匹配 | ✓ 可匹配 |
+| 客户端凭证令牌 | ✓ 可匹配 | ✗ 不匹配 (Username 为空) | ✗ 不匹配 (Groups 为空) |
+
+### 11.3 双因素认证资源的可达性差异
+
+#### 11.3.1 用户令牌的双因素可达性
+
+**认证级别判定**:
+```go
+// 用户令牌：根据 amr 声明动态判定
+if authorization.NewAuthenticationMethodsReferencesFromClaim(
+    osession.DefaultSession.Claims.AuthenticationMethodsReferences,
+).MultiFactorAuthentication() {
+    level = authentication.TwoFactor  // 用户完成了 2FA
+} else {
+    level = authentication.OneFactor  // 用户只完成了密码认证
+}
+```
+
+**访问结果**:
+| 用户完成的认证 | Token 中的 amr | 认证级别 | two_factor 资源 | one_factor 资源 |
+|--------------|---------------|---------|----------------|----------------|
+| 仅密码 | ["pwd"] | OneFactor | ✗ 401 Unauthorized | ✓ 200 OK |
+| 密码 + TOTP | ["pwd", "otp", "mfa"] | TwoFactor | ✓ 200 OK | ✓ 200 OK |
+
+**用户令牌访问 two_factor 资源的流程**:
+```
+1. 用户完成 1FA（密码）→ amr: ["pwd"] → level: OneFactor
+2. 访问 two_factor 资源 → OneFactor < TwoFactor → 401 重定向
+3. 用户完成 TOTP 2FA → amr: ["pwd", "otp", "mfa"]
+4. 新 Token 包含 mfa 声明 → level: TwoFactor
+5. 访问 two_factor 资源 → ✓ 授权成功
+```
+
+#### 11.3.2 客户端凭证令牌的双因素可达性
+
+**认证级别判定**:
+```go
+// 客户端凭证令牌：固定为 OneFactor
+if osession.ClientCredentials {
+    return "", osession.ClientID, true, authentication.OneFactor, nil
+}
+```
+
+**访问结果**:
+| 资源要求策略 | 客户端凭证令牌级别 | 访问结果 | 原因 |
+|------------|------------------|---------|------|
+| one_factor | OneFactor | ✓ 200 OK | 级别足够 |
+| two_factor | OneFactor | ✗ 401 Unauthorized | 级别不足 |
+| bypass | OneFactor | ✓ 200 OK | 绕过认证 |
+| deny | OneFactor | ✗ 403 Forbidden | 规则拒绝 |
+
+**关键限制：客户端凭证令牌无法达到 TwoFactor 级别**
+- 客户端凭证流程（`grant_type=client_credentials`）无用户参与
+- 没有用户交互就无法完成第二因素认证（TOTP/WebAuthn 等）
+- 因此 `ClientCredentials` 模式的令牌认证级别永久固定为 `OneFactor`
+- **结论：客户端凭证令牌永远无法访问 policy=two_factor 的资源**
+
+#### 11.3.3 实际场景对比
+
+**场景 A：机器到机器 API 调用（客户端凭证）**
+```yaml
+# 可行的配置
+access_control:
+  rules:
+    - domain: api.example.com
+      resources: ["^/public/.*$"]
+      subject: ["oauth2:client:api-service"]
+      policy: one_factor  # ✓ 客户端凭证可以访问
+
+    - domain: api.example.com
+      resources: ["^/admin/.*$"]
+      subject: ["oauth2:client:admin-service"]
+      policy: two_factor  # ✗ 客户端凭证永远无法访问
+```
+
+**场景 B：用户浏览器 + API 后端调用（用户令牌）**
+```yaml
+# 可行的配置
+access_control:
+  rules:
+    - domain: app.example.com
+      subject: ["group:users"]
+      policy: one_factor  # ✓ 用户完成密码即可访问
+
+    - domain: app.example.com
+      resources: ["^/settings/.*$"]
+      subject: ["group:admins"]
+      policy: two_factor  # ✓ 用户完成 2FA 即可访问
+```
+
+#### 11.3.4 配置最佳实践
+
+1. **为客户端凭证令牌专门设计访问规则**:
+   ```yaml
+   access_control:
+     rules:
+       # 客户端凭证专用规则
+       - domain: api.example.com
+         subject: ["oauth2:client:backend", "oauth2:client:worker"]
+         policy: one_factor
+         methods: ["GET", "POST"]
+   ```
+
+2. **不要给客户端凭证令牌配置 two_factor 策略**:
+   ```yaml
+   # ❌ 无效配置：永远无法匹配
+   - domain: api.example.com
+     subject: ["oauth2:client:backend"]
+     policy: two_factor
+   ```
+
+3. **对敏感操作考虑额外的认证机制**:
+   - 使用客户端证书双向认证 (mTLS)
+   - 要求特定的请求签名
+   - 使用网络白名单限制源 IP
+
+4. **用户令牌与客户端凭证分离配置**:
+   ```yaml
+   access_control:
+     rules:
+       # 用户访问前端应用
+       - domain: app.example.com
+         subject: ["group:users"]
+         policy: two_factor
+       
+       # 服务间 API 调用
+       - domain: api.example.com
+         subject: ["oauth2:client:backend-service"]
+         policy: one_factor
+         networks: ["10.0.0.0/8"]  # 仅限内网调用
+   ```
+
+---
+
+## 12. 文件位置索引
 
 | 功能模块 | 文件路径 |
 |---------|--------|
