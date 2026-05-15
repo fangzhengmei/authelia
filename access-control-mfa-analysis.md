@@ -1140,9 +1140,11 @@ if !s.schemes.Has(scheme) {
 
 | 场景 | 行为 | 结果 |
 |------|------|------|
-| 请求带 Bearer Token 但 scheme 未配置 | Header 策略直接返回 | 继续执行下一个策略（通常是 Cookie） |
-| 请求带 Bearer Token 且 scheme 已配置 | 执行令牌内省流程 | Token 有效则认证成功，无效则返回错误 |
-| 请求既带 Cookie 又带 Bearer Token | Header 策略优先处理 | Bearer 有效则走令牌流程，无效 fallback 到 Cookie |
+| 请求带 Bearer Token 但 scheme 未配置 | Header 策略检测 scheme 不匹配，返回 `nil` 错误 | 继续执行下一个策略（通常是 Cookie） |
+| 请求带 Bearer Token 且 scheme 已配置但 Token 无效 | 执行令牌内省，返回认证错误 | `CanHandleUnauthorized()=true`，循环终止，**不尝试 Cookie** |
+| 请求带 Bearer Token 且 scheme 已配置且 Token 有效 | 令牌内省成功 | 认证成功，循环终止 |
+| 请求既带 Cookie 又带 Bearer Token（scheme 未配置） | scheme 不匹配，Header 策略跳过 | 继续执行 Cookie 策略 |
+| 请求既带 Cookie 又带 Bearer Token（scheme 已配置但 Token 无效） | Header 策略返回错误 | 循环终止，**不会 fallback 到 Cookie** |
 
 **默认配置情况**：
 ```yaml
