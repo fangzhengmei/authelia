@@ -171,14 +171,16 @@ func ConsentGrant(consent *model.OAuth2ConsentSession, explicit bool, claims []s
 
 ### 5.3 `ConsentGrantImplicit` 辅助函数
 
-为隐式模式封装的便捷函数：
+为隐式模式封装的便捷函数（`internal/oidc/session.go:219`）：
 ```go
-func ConsentGrantImplicit(consent *model.OAuth2ConsentSession, subject uuid.UUID, claims []string) {
-    consent.RespondedAt = time.Now()
-    consent.Subject.UUID = subject
+func ConsentGrantImplicit(consent *model.OAuth2ConsentSession, claims []string, subject uuid.UUID, respondedAt time.Time) {
+    consent.SetRespondedAt(respondedAt, 0)
+    consent.SetSubject(subject)
     ConsentGrant(consent, false, claims)
 }
 ```
+
+**参数顺序说明**：按实际代码，参数顺序为 `consent` → `claims` → `subject` → `respondedAt`，调用方（如隐式模式处理器）会传入 `ctx.GetClock().Now()` 作为时间参数。
 
 ## 六、Pre-configured Scope 缓存机制
 
@@ -198,19 +200,31 @@ func ConsentGrantImplicit(consent *model.OAuth2ConsentSession, subject uuid.UUID
 
 ### 6.2 缓存匹配逻辑
 
-`handleOAuth2AuthorizationConsentModePreConfiguredGetPreConfig` 执行匹配：
+`handleOAuth2AuthorizationConsentModePreConfiguredGetPreConfig`（`internal/handlers/handler_oauth2_authorization_consent_preconfigured.go:217`）执行匹配：
 
-1. 加载该用户对该客户端的所有有效预配置记录
-2. **精确匹配 Scopes**：`HasExactGrantedScopes` 要求 scope 列表完全一致
-3. **精确匹配 Audience**：`HasExactGrantedAudience` 要求受众列表完全一致
-4. **匹配 Claims 签名**：`HasClaimsSignature` 对请求的 claims 进行签名比对
-5. 全部匹配成功 → 使用预配置的 scope 和 claims
+1. 调用 `LoadOAuth2ConsentPreConfigurations` 加载该用户对该客户端的所有有效预配置记录
+2. 遍历记录，依次执行以下匹配检查：
+   - **有效性检查**：`config.CanConsentAt(ctx.GetClock().Now())` 检查是否已过期、被撤销
+   - **精确匹配 Grants**：`config.HasExactGrants(scopes, audience)`（`internal/model/oidc.go:225`）
+     - 内部调用 `HasExactGrantedScopes(scopes)` 精确匹配 scope 列表
+     - 内部调用 `HasExactGrantedAudience(audience)` 精确匹配 audience 列表
+   - **匹配 Claims 签名**：`config.HasClaimsSignature(signature)`（`internal/model/oidc.go:240`）对请求的 claims 签名进行比对
+3. 全部匹配成功 → 返回该预配置记录，用于后续授权
+
+**匹配方法的真实命名对照**：
+
+| 概念描述 | 实际代码方法名 | 所在文件 |
+|---------|---------------|---------|
+| 精确匹配 scope 和 audience | `HasExactGrants(scopes, audience []string)` | `internal/model/oidc.go:225` |
+| 精确匹配 scope 列表 | `HasExactGrantedScopes(scopes []string)` | `internal/model/oidc.go:235` |
+| 精确匹配 audience 列表 | `HasExactGrantedAudience(audience []string)` | `internal/model/oidc.go:230` |
+| 匹配 claims 签名 | `HasClaimsSignature(signature string)` | `internal/model/oidc.go:240` |
 
 ### 6.3 缓存的创建与生命周期
 
-- **创建时机**：用户在显式同意页勾选"记住此选择"并提交同意后
+- **创建时机**：用户在显式同意页勾选"记住此选择"并提交同意后，调用 `SaveOAuth2ConsentPreConfiguration` 保存
 - **有效期**：由客户端配置的 `consent.duration` 决定
-- **失效条件**：过期、被用户撤销、scope/audience/claims 不匹配
+- **失效条件**：过期、被用户撤销、`HasExactGrants` 不匹配、`HasClaimsSignature` 不匹配
 
 ## 七、三者关系的概念模型
 
@@ -237,14 +251,18 @@ func ConsentGrantImplicit(consent *model.OAuth2ConsentSession, subject uuid.UUID
 检查认证级别（IsAuthenticationLevelSufficient）
     ├─ 足够 → 进入同意模式分支（显式/隐式/预配置）
     │       ↓
-    │   Scope 计算
-    │       ↓
     │   预配置缓存匹配（仅 pre-configured 模式）
+    │   · 调用 LoadOAuth2ConsentPreConfigurations 加载记录
+    │   · CanConsentAt 检查有效性
+    │   · HasExactGrants 精确匹配 scope + audience
+    │   · HasClaimsSignature 匹配 claims 签名
+    │       ↓
+    │   Scope 计算（ConsentGrant / ConsentGrantImplicit）
     │       ↓
     │   生成授权响应
     │
     └─ 不足 → 重定向到登录/2FA 认证流程
-             （不是会话提升流程）
+             （绝对不会进入会话提升流程）
 ```
 
 **关键结论：Scope 计算、预配置缓存匹配与会话提升三者在 OIDC 授权流程中没有任何直接交互。**
@@ -323,7 +341,7 @@ func ConsentGrantImplicit(consent *model.OAuth2ConsentSession, subject uuid.UUID
 ## 九、总结
 
 1. **OIDC 授权确认链路中，认证级别是唯一的准入条件**，会话提升不直接参与授权决策
-2. **显式同意和隐式自动放行的核心差异在于 Scope 计算**：显式模式授予所有 scope，隐式模式排除 offline_access 等高权限 scope
-3. **预配置缓存是显式同意的扩展**，用于记住用户的选择，减少重复操作
+2. **显式同意和隐式自动放行的核心差异在于 Scope 计算**：显式模式调用 `ConsentGrant(..., true, ...)` 授予所有 scope，隐式模式调用 `ConsentGrantImplicit` 排除 offline_access 等高权限 scope
+3. **预配置缓存匹配由 `handleOAuth2AuthorizationConsentModePreConfiguredGetPreConfig` 驱动**，依次调用 `CanConsentAt` → `HasExactGrants` → `HasClaimsSignature` 完成精确匹配
 4. **会话提升是独立于 OIDC 授权的安全机制**，用于保护敏感操作（修改密码、注册 2FA 设备等）
 5. 三个机制**正交但协同**，共同构成了 Authelia 的分层安全体系
