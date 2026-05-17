@@ -88,25 +88,52 @@ if client.IsAuthenticationLevelSufficient(userSession.AuthenticationLevel(...), 
 
 ### 2.3 同意后续流程：按 Response Type 区分
 
-同意完成后，最终授权响应的生成由 `response_type` 决定，Authelia 支持全部 7 种标准 response type（`internal/oidc/const.go:137`）：
+同意完成后，最终授权响应的生成由 `response_type` 决定。这里需要明确**两个层面**的 response type 支持：
 
-| 类别 | Response Type | 说明 | 返回内容 |
-|------|--------------|------|---------|
-| **授权码流程** | `code` | 标准 Authorization Code Flow | 仅返回授权码 |
-| **Implicit 流程** | `id_token` | Implicit Flow，仅返回 ID Token | ID Token |
-| | `token` | Implicit Flow，仅返回 Access Token | Access Token |
-| | `id_token token` | Implicit Flow，同时返回 | ID Token + Access Token |
-| **Hybrid 流程** | `code id_token` | Hybrid Flow | 授权码 + ID Token |
-| | `code token` | Hybrid Flow | 授权码 + Access Token |
-| | `code id_token token` | Hybrid Flow | 授权码 + ID Token + Access Token |
+#### 2.3.1 服务器 Discovery 声明的支持能力
+
+`/.well-known/openid-configuration` 端点（`internal/oidc/discovery.go:16-24`）会声明 Authelia 作为 OP（OpenID Provider）**全局支持全部 7 种标准 response type**：
+
+| 类别 | Response Type | 说明 |
+|------|--------------|------|
+| 授权码流程 | `code` | Authorization Code Flow |
+| Implicit 流程 | `id_token` / `token` / `id_token token` | Implicit Flow 变体 |
+| Hybrid 流程 | `code id_token` / `code token` / `code id_token token` | Hybrid Flow 变体 |
+
+这是服务器的**能力声明**，告诉客户端"我能处理这些 response type"。
+
+#### 2.3.2 单个客户端的实际可用限制
+
+单个客户端的可用 response type 由**配置项**决定，而非服务器全局能力：
+
+- **配置项**：`identity_providers.oidc.clients[].response_types`
+- **默认值**：`["code"]`（`internal/configuration/schema/identity_providers.go:265`），即默认仅支持授权码流程
+- **可配置值**：必须是上述 7 种中的一种或多种
+- **验证位置**：`validateOIDCClientResponseTypes`（`internal/configuration/validator/identity_providers.go:1109`）
+
+**关键限制**：
+- 客户端配置决定了该客户端**实际能请求**的 response type
+- 即使服务器支持 7 种，如果客户端只配置了 `["code"]`，那么该客户端请求 `response_type=id_token` 会被拒绝
+- 这层限制是**配置时验证**和**运行时检查**的双重保障
+
+#### 2.3.3 Response Type 对同意后续路径的影响
+
+同意流程本身（显式/隐式/预配置）与 response type 是**正交**的，即无论哪种同意模式，最终都支持全部 7 种 response type。但客户端配置的 response type 会直接限制：
+
+1. **能否使用强制显式同意触发条件**：
+   - `offline` / `offline_access` / `authelia.bearer.authz` 这些高权限 scope 的强制显式同意检查，**仅当 response_type 包含 `code` 时才触发**（`RequesterIsAuthorizeCodeFlow` 判断）
+   - 如果客户端仅配置了 Implicit flow 的 response type（如 `id_token token`），则即使请求了 offline_access，也不会触发强制显式同意（但此时 offline_access 本身也没有实际意义）
+
+2. **能否使用预配置缓存**：
+   - 预配置缓存本身不依赖 response type，但如果客户端不支持 code flow，预配置缓存中的 `offline_access` 等 scope 无法被实际授予
+
+3. **授权响应的实际内容**：
+   - `NewAuthorizeResponse`（`internal/handlers/handler_oauth2_authorization.go:158`）根据 `requester.GetResponseTypes()` 自动构造对应响应
+   - `HydrateIDTokenClaims`（`internal/handlers/handler_oauth2_authorization_claims.go:60`）会通过 `GetResponseTypes().ExactOne(ResponseTypeImplicitFlowIDToken)` 判断是否为纯 Implicit 流程，以决定 ID Token 的填充策略
 
 **代码中的判定位置**：
-- `NewAuthorizeResponse`（`internal/handlers/handler_oauth2_authorization.go:158`）根据 `requester.GetResponseTypes()` 自动构造对应响应
-- `HydrateIDTokenClaims`（`internal/handlers/handler_oauth2_authorization_claims.go:60`）中会通过 `GetResponseTypes().ExactOne(ResponseTypeImplicitFlowIDToken)` 判断是否为纯 Implicit 流程，以决定 ID Token 的填充策略
-
-**关键说明**：
-- 同意流程本身（显式/隐式/预配置）与 response type 是**正交**的：无论哪种同意模式，最终都支持全部 7 种 response type
-- 只有当 `response_type` 包含 `code` 时（授权码流程 + 所有 Hybrid 流程），`RequesterIsAuthorizeCodeFlow` 才返回 true，此时才会触发 offline_access 等 scope 的强制显式同意检查
+- `RequesterIsAuthorizeCodeFlow`（`internal/oidc/util.go`）：判断请求是否包含 code flow 的 response type
+- 运行时还会校验 `requester.GetResponseTypes()` 是否在客户端配置的 `response_types` 范围内
 
 ## 三、强制显式同意的完整触发条件
 
