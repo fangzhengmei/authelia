@@ -146,9 +146,33 @@ var ResetPasswordIdentityStart = middlewares.IdentityVerificationStart(
 )
 ```
 
-**4. 通知调用点**（`internal/middlewares/identity_verification.go:129`）：
+**4. 关键代码分支分析**
+
+让我们逐行分析 `IdentityVerificationStart` 中间件的返回逻辑：
+
 ```go
-// 这是通用的身份验证启动中间件
+// 代码位置: internal/middlewares/identity_verification.go:40-47
+identity, err := args.IdentityRetrieverFunc(ctx)
+if err != nil {
+    // In that case we reply ok to avoid user enumeration.
+    ctx.GetLogger().Error(err)
+    ctx.ReplyOK()  // ✅ 分支1：用户不存在时，固定返回 200！
+    return
+}
+```
+
+> **重要修正**：当用户不存在时（`IdentityRetrieverFunc` 失败），系统会返回 200 OK 而不是错误！这是为了防止用户枚举攻击。注释明确写着："We need to ensure the attacker cannot perform user enumeration by always replying with 200 whatever what happens in backend."
+
+```go
+// 代码位置: internal/middlewares/identity_verification.go:82-85
+if err = ctx.Providers.StorageProvider.SaveIdentityVerification(ctx, verification); err != nil {
+    ctx.Error(err, messageOperationFailed)  // ❌ 存储失败，返回错误
+    return
+}
+
+// ... 生成链接等操作 ...
+
+// 代码位置: internal/middlewares/identity_verification.go:129-132
 if err = ctx.Providers.Notifier.Send(
     ctx, 
     identity.Address(),           // 接收者邮箱
@@ -156,33 +180,50 @@ if err = ctx.Providers.Notifier.Send(
     ctx.Providers.Templates.GetIdentityVerificationJWTEmailTemplate(), 
     data,                         // 包含重置链接、用户名等
 ); err != nil {
-    ctx.Error(err, messageOperationFailed)  // 返回 500 错误
-    return  // ❌ 阻断流程
+    ctx.Error(err, messageOperationFailed)  // ❌ 通知失败，返回错误
+    return
 }
 ```
 
-**5. 失败策略：❌ 阻断流程**
-- 通知发送失败时，向用户返回操作失败错误
-- 原因：用户必须收到邮件才能继续重置流程
+**5. 失败策略：**
+| 失败场景 | 返回状态 | 说明 |
+|---------|---------|------|
+| 用户不存在 | ✅ 200 OK | 防止用户枚举 |
+| 令牌生成失败 | ❌ 500 Error | 内部错误 |
+| 存储令牌失败 | ❌ 500 Error | 数据库错误 |
+| 发送通知失败 | ❌ 500 Error | SMTP/文件系统错误 |
+| 全部成功 | ✅ 200 OK | 正常流程 |
+
+> **⚠️ 重要发现**：先落库再发通知！如果第82行存储成功但第129行通知失败，令牌已经在数据库中了，但用户会收到错误响应。这会产生"僵尸"验证记录——数据库中有有效令牌，但用户没收到邮件，也不知道可以重试。
 
 ---
 
-### 3.2 场景二：密码重置 - 重置成功通知
+### 3.2 场景二：密码重置 - 令牌校验与完成验证
 
 #### 完整调用链路
 
 ```
 用户点击邮件中的重置链接 → 进入重置页面
     ↓
-用户输入新密码 → 前端 POST /api/reset-password
+前端 POST /api/reset-password/identity/finish (携带 token)
     ↓
-路由匹配: handlers.go:270
+路由匹配: handlers.go:268
     ↓
-Handler: handlers.ResetPasswordPOST
+中间件: IdentityVerificationFinish
     ↓
-验证 JWT Token 有效性
+✅ JWT Token 校验（签名、过期、是否已使用）
     ↓
-更新用户密码（调用 UserProvider.UpdatePassword）
+标记令牌为已消费（ConsumeIdentityVerification）
+    ↓
+设置 session.PasswordResetUsername = username
+    ↓
+返回 200 OK
+    ↓
+前端 POST /api/reset-password (携带新密码)
+    ↓
+Handler: ResetPasswordPOST 检查 session 中是否有 PasswordResetUsername
+    ↓
+更新用户密码
     ↓
 ✅ 调用 Notifier.Send() 发送"密码已重置"通知
     ↓
@@ -191,14 +232,70 @@ Handler: handlers.ResetPasswordPOST
 
 #### 逐段详细说明
 
-**1. 发起方：** 用户在重置密码页面输入新密码后提交
+> **重要修正**：JWT 令牌校验**不发生**在 `ResetPasswordPOST` 中，而是发生在**前一个请求**的 `IdentityVerificationFinish` 中间件中！
 
-**2. 路由入口**（`internal/server/handlers.go:270`）：
+**1. 令牌校验阶段**（`internal/middlewares/identity_verification.go:143-264`）：
 ```go
-r.POST("/api/reset-password", middlewareAPI(handlers.ResetPasswordPOST))
+func IdentityVerificationFinish(args IdentityVerificationFinishArgs, next func(...)) RequestHandler {
+    return func(ctx *AutheliaCtx) {
+        // 步骤1: 解析 token
+        token, err := jwt.ParseWithClaims(finishBody.Token, ...)
+        
+        // 步骤2: 校验 token - 多种错误场景
+        switch {
+        case errors.Is(err, jwt.ErrTokenMalformed): ...     // token 格式错误
+        case errors.Is(err, jwt.ErrTokenExpired): ...       // token 已过期
+        case errors.Is(err, jwt.ErrTokenNotValidYet): ...  // token 尚未生效
+        case errors.Is(err, jwt.ErrTokenSignatureInvalid): // 签名错误
+        }
+        
+        // 步骤3: 检查数据库中是否存在且未使用
+        found, err := ctx.Providers.StorageProvider.FindIdentityVerification(ctx, verification.JTI.String())
+        if !found {
+            ctx.SetJSONError(messageIdentityVerificationTokenAlreadyUsed)
+            return
+        }
+        
+        // 步骤4: 标记为已消费
+        if err = ctx.Providers.StorageProvider.ConsumeIdentityVerification(ctx, claims.ID, ...); err != nil {
+            ctx.SetJSONError(messageOperationFailed)
+            return
+        }
+        
+        // 步骤5: 设置 session 标记
+        next(ctx, claims.Username)  // 调用 resetPasswordIdentityVerificationFinish
+    }
+}
 ```
 
-**3. 通知调用点**（`internal/handlers/handler_reset_password.go:223`）：
+**2. Session 标记**（`internal/handlers/handler_reset_password.go:267-286`）：
+```go
+func resetPasswordIdentityVerificationFinish(ctx *middlewares.AutheliaCtx, username string) {
+    ctx.ReplyOK()  // 先返回 200 OK
+    
+    // 设置 session 标记，供后续 ResetPasswordPOST 使用
+    userSession.PasswordResetUsername = &username
+    ctx.SaveSession(userSession)
+}
+```
+
+**3. 实际重置密码**（`internal/handlers/handler_reset_password.go:136-229`）：
+```go
+func ResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
+    // 只检查 session 中是否有标记，不再校验 JWT！
+    if userSession.PasswordResetUsername == nil {
+        ctx.Error(fmt.Errorf("no identity verification process has been initiated"), ...)
+        return
+    }
+    
+    // 更新密码...
+    ctx.Providers.UserProvider.UpdatePassword(username, requestBody.Password)
+    
+    // 发送通知（见下文）
+}
+```
+
+**4. 通知调用点**（`internal/handlers/handler_reset_password.go:223`）：
 ```go
 // 密码已经成功更新，现在发送通知
 data := templates.EmailEventValues{
@@ -224,10 +321,16 @@ if err = ctx.Providers.Notifier.Send(
 }
 ```
 
-**4. 失败策略：✅ 容错继续**
+**5. 失败策略：✅ 容错继续**
 - 通知发送失败时，仅记录错误日志
 - 仍向用户返回操作成功
 - 原因：密码已经成功更新，通知只是事后告知，不应该因为通知失败而让用户困惑
+
+**关键设计洞察**：
+- 令牌校验与密码重置是**两个独立的 HTTP 请求**
+- 第一个请求 (`/identity/finish`) 负责验证身份并设置 session 标记
+- 第二个请求 (`/reset-password`) 只信任 session 标记，不再验证 JWT
+- 这种设计允许前端在两个请求之间展示"验证成功，请输入新密码"的页面
 
 ---
 
@@ -248,11 +351,14 @@ if err = ctx.Providers.Notifier.Send(
     ↓
 Handler: handlers.UserSessionElevationPOST
     ↓
-生成 OneTimeCode 并保存到 Storage
+生成 OneTimeCode
     ↓
-✅ 调用 Notifier.Send() 发送验证码邮件
+✅ 先保存到 Storage（SaveOneTimeCode）
     ↓
-返回 200 OK（带撤销 ID）
+✅ 再调用 Notifier.Send() 发送验证码邮件
+    ↓
+通知成功 → 返回 200 OK（带撤销 ID）
+通知失败 → 返回 403 Forbidden（但验证码已在数据库中！）
 ```
 
 #### 逐段详细说明
@@ -271,7 +377,48 @@ middlewareElevatePOST := middlewares.NewBridgeBuilder(*config, providers).
 r.POST("/api/user/session/elevation", middlewareElevatePOST(handlers.UserSessionElevationPOST))
 ```
 
-**3. 通知调用点**（`internal/handlers/handler_session_elevation.go:204`）：
+**3. 关键代码执行顺序**（`internal/handlers/handler_session_elevation.go:158-211`）：
+
+```go
+// 步骤1: 生成 OTC
+if otp, err = model.NewOneTimeCode(ctx, ...); err != nil {
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    return
+}
+
+// 步骤2: ✅ 先落库！
+if signature, err = ctx.Providers.StorageProvider.SaveOneTimeCode(ctx, *otp); err != nil {
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    return
+}
+
+// ... 准备邮件内容 ...
+
+// 步骤3: ✅ 再发通知！
+if err = ctx.Providers.Notifier.Send(ctx, identity.Address(), data.Title, ...); err != nil {
+    ctx.Logger.WithError(err).Error("error occurred sending the user the notification")
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    ctx.SetJSONError(messageOperationFailed)
+    return  // ❌ 返回错误，但验证码已经在数据库中了！
+}
+
+// 步骤4: 通知成功才返回成功响应
+if err = ctx.SetJSONBody(&bodyPOSTUserSessionElevate{DeleteID: deleteID}); err != nil {
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    return
+}
+```
+
+> **⚠️ 重要发现**：先落库再发通知！
+> 
+> 如果第169行 `SaveOneTimeCode` 成功，但第204行 `Notifier.Send` 失败：
+> - 数据库中已经保存了一个有效的 OTC 验证码
+> - 但用户收到了 403 Forbidden 错误
+> - 用户不知道验证码已经生成，无法继续流程
+> - 这个 OTC 会一直留在数据库中直到过期（默认可能是几分钟）
+> - 期间如果用户重试，会生成**新的** OTC，旧的成为"僵尸"记录
+
+**4. 通知调用点**（`internal/handlers/handler_session_elevation.go:204`）：
 ```go
 data := templates.EmailIdentityVerificationOTCValues{
     Title:              "Confirm your identity",
@@ -296,9 +443,21 @@ if err = ctx.Providers.Notifier.Send(
 }
 ```
 
-**4. 失败策略：❌ 阻断流程**
+**5. 失败策略：❌ 阻断流程**
 - 通知发送失败时，返回 403 Forbidden
 - 原因：用户必须收到验证码才能完成提升，没有验证码无法继续
+- **副作用**：数据库中残留已生成但未使用的 OTC 记录
+
+**6. 与密码重置场景的对比**
+
+| 项目 | 密码重置（IdentityVerificationStart） | 会话提升（UserSessionElevationPOST） |
+|-----|------------------------------------|----------------------------------|
+| 落库时机 | 发送通知前 SaveIdentityVerification | 发送通知前 SaveOneTimeCode |
+| 通知失败返回 | 500 Error | 403 Forbidden |
+| 通知失败时数据状态 | 令牌已在数据库中 | 验证码已在数据库中 |
+| 用户感知 | 知道操作失败 | 知道操作失败 |
+| 数据自动清理 | 令牌过期后清理 | OTC 过期后清理 |
+| 重试影响 | 生成新令牌，旧的失效 | 生成新 OTC，旧的仍有效直到过期 |
 
 ---
 
@@ -446,14 +605,15 @@ ctxLogEvent(ctx, userSession.Username, eventLogAction2FAAdded, body,
 
 ### 3.6 通知触发场景汇总表
 
-| 场景 | 发起方 | API 端点 | 通知时机 | 失败策略 |
-|-----|-------|---------|---------|---------|
-| 发送密码重置链接 | 用户点击"忘记密码" | `POST /api/reset-password/identity/start` | 生成 JWT 后 | ❌ 阻断 |
-| 密码重置成功通知 | 用户提交新密码 | `POST /api/reset-password` | 密码更新后 | ✅ 继续 |
-| 会话提升验证码 | 访问敏感资源 | `POST /api/user/session/elevation` | 生成 OTC 后 | ❌ 阻断 |
-| 密码修改成功通知 | 用户修改密码 | `POST /api/change-password` | 密码更新后 | ✅ 继续 |
-| 2FA 设备添加通知 | 用户添加 2FA | 各 2FA 注册端点 | 设备保存后 | ✅ 继续 |
-| 2FA 设备删除通知 | 用户删除 2FA | 各 2FA 删除端点 | 设备删除后 | ✅ 继续 |
+| 场景 | 发起方 | API 端点 | 通知时机 | 失败策略 | 先落库后通知 |
+|-----|-------|---------|---------|---------|------------|
+| 发送密码重置链接 | 用户点击"忘记密码" | `POST /api/reset-password/identity/start` | 生成 JWT 并保存后 | ❌ 阻断（特殊：用户不存在返回 200） | ✅ 是 |
+| 密码重置令牌校验 | 用户点击邮件链接 | `POST /api/reset-password/identity/finish` | 无通知（仅校验令牌） | ❌ 阻断（校验失败返回错误） | - |
+| 密码重置成功通知 | 用户提交新密码 | `POST /api/reset-password` | 密码更新后 | ✅ 继续 | ❌ 否 |
+| 会话提升验证码 | 访问敏感资源 | `POST /api/user/session/elevation` | 生成 OTC 并保存后 | ❌ 阻断 | ✅ 是 |
+| 密码修改成功通知 | 用户修改密码 | `POST /api/change-password` | 密码更新后 | ✅ 继续 | ❌ 否 |
+| 2FA 设备添加通知 | 用户添加 2FA | 各 2FA 注册端点 | 设备保存后 | ✅ 继续 | ❌ 否 |
+| 2FA 设备删除通知 | 用户删除 2FA | 各 2FA 删除端点 | 设备删除后 | ✅ 继续 | ❌ 否 |
 
 ---
 
@@ -484,6 +644,105 @@ ctxLogEvent(ctx, userSession.Username, eventLogAction2FAAdded, body,
                                             ↓失败
                                           记录日志，仍返回成功
 ```
+
+---
+
+### 3.8 先落库再发通知的深度分析
+
+#### 问题发现
+
+在两个关键场景中，代码采用了「先持久化到数据库，再发送通知」的模式：
+
+| 场景 | 落库操作 | 通知操作 | 代码位置 |
+|-----|---------|---------|---------|
+| 密码重置启动 | `SaveIdentityVerification` | `Notifier.Send` | `identity_verification.go:82, 129` |
+| 会话提升 | `SaveOneTimeCode` | `Notifier.Send` | `handler_session_elevation.go:169, 204` |
+
+#### 执行顺序伪代码
+
+```go
+// 模式：先落库再发通知
+if err = storage.SaveChallenge(challenge); err != nil {
+    return error  // 存储失败，返回错误
+}
+
+// 👇 如果这里通知失败...
+if err = notifier.Send(recipient, challenge); err != nil {
+    return error  // 返回错误，但 challenge 已经在数据库里了！
+}
+
+return success
+```
+
+#### 状态一致性问题
+
+**当通知发送失败时，系统处于不一致状态：**
+
+1. **数据库状态**：有效验证记录已存在（令牌/OTC）
+2. **用户感知**：收到错误响应，认为操作失败
+3. **实际情况**：验证记录已生成，只是用户没收到
+4. **后果**：
+   - 产生"僵尸"验证记录，占用数据库空间
+   - 用户重试时会生成新记录，旧记录直到过期才会被清理
+   - 如果攻击者 somehow 获取到了已生成但未通知的令牌，可能存在安全隐患（虽然概率很低）
+
+#### 设计权衡分析
+
+**为什么不采用「先发通知再落库」？**
+
+```go
+// 替代方案：先发通知再落库
+if err = notifier.Send(recipient, challenge); err != nil {
+    return error  // 通知失败，不存库
+}
+
+if err = storage.SaveChallenge(challenge); err != nil {
+    // 😱 新问题：通知发出去了，但存储失败！
+    // 用户收到了验证码，但系统不认，用户体验更差
+    return error
+}
+```
+
+**两种方案的权衡：**
+
+| 方案 | 通知成功 | 通知失败 | 存储成功 | 存储失败 | 一致性问题 |
+|-----|---------|---------|---------|---------|----------|
+| 先落库后发通知 | ✅ 正常 | ⚠️ 库有记录，用户不知 | ✅ 正常 | ❌ 不发通知 | 通知失败时不一致 |
+| 先发通知后落库 | ✅ 正常 | ✅ 不存库 | ✅ 正常 | ⚠️ 用户收到无效码 | 存储失败时不一致 |
+
+**Authelia 选择了「先落库后发通知」的原因：**
+- 宁可数据库多几条无效记录，也不让用户收到无法使用的验证码
+- 用户体验角度：收到无效验证码比没收到更令人困惑
+- 数据一致性角度：数据库中的记录是事实来源，通知只是传递手段
+
+#### 潜在改进方向
+
+如果要优化这个问题，可以考虑：
+
+1. **分布式事务**：使用 TCC 或 SAGA 模式保证通知和存储的原子性（复杂度高）
+2. **补偿机制**：通知失败后异步删除或标记数据库记录为无效
+3. **重试机制**：通知失败后后台异步重试 N 次，而不是直接返回错误
+4. **用户友好提示**：通知失败时告诉用户"系统可能无法发送邮件，请稍后重试"
+
+#### 用户枚举攻击防护的特殊分支
+
+在密码重置启动场景中，有一个特殊的固定返回 200 的分支：
+
+```go
+// internal/middlewares/identity_verification.go:40-47
+identity, err := args.IdentityRetrieverFunc(ctx)
+if err != nil {
+    // In that case we reply ok to avoid user enumeration.
+    ctx.GetLogger().Error(err)
+    ctx.ReplyOK()  // 无论用户是否存在，都返回 200
+    return
+}
+```
+
+**设计意图：**
+- 防止攻击者通过返回状态差异枚举系统中的有效用户名
+- 即使邮箱不存在或查询失败，也不向调用者暴露这个信息
+- 这是安全最佳实践，但也意味着用户可能在邮箱输入错误时完全不知道
 
 ---
 
@@ -621,9 +880,9 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
 
 ---
 
-## 七、总结
+## 八、总结
 
-### 7.1 核心流程
+### 8.1 核心流程
 
 ```
 配置加载 → 配置验证 → 通知器初始化 → 启动检查 → 运行时触发发送
@@ -631,14 +890,53 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
   读取配置   确保合法   创建SMTP/File   验证连通性    按场景失败处理
 ```
 
-### 7.2 关键设计决策
+### 8.2 关键设计决策
 
 1. **单通知通道设计**：同一时间只能使用一种通知通道，简化配置和维护
 2. **差异化失败处理**：关键操作阻断，非关键操作容错
 3. **无自动回退**：通知失败需要人工介入，不自动降级
 4. **启动检查**：提前发现配置问题，避免运行时故障
+5. **先落库后发通知**：宁可产生僵尸记录，也不让用户收到无效验证码
+6. **用户枚举防护**：密码重置时用户不存在也返回 200，防止用户名枚举
 
-### 7.3 扩展点
+### 8.3 重要修正与发现
+
+**之前分析的错误点及修正：**
+
+| 之前的错误结论 | 修正后的正确结论 | 代码依据 |
+|--------------|----------------|---------|
+| 令牌校验在 ResetPasswordPOST 中 | 令牌校验在 IdentityVerificationFinish 中间件中，是独立的 HTTP 请求 | `identity_verification.go:143-264` |
+| 密码重置启动失败都返回错误 | 用户不存在时固定返回 200 OK（防枚举） | `identity_verification.go:40-47` |
+| 通知失败时数据状态一致 | 先落库后发通知，失败时数据库中已有记录 | `identity_verification.go:82, 129` |
+| 会话提升通知失败无副作用 | OTC 已在数据库中，重试会生成新记录 | `handler_session_elevation.go:169, 204` |
+
+### 8.4 密码重置完整流程修正后
+
+```
+步骤1: POST /api/reset-password/identity/start
+   ↓
+生成 JWT → SaveIdentityVerification ✅ → Notifier.Send ✉️
+   ↓                             ↓失败
+返回 200（用户不存在也返回200）  返回 500（但令牌已入库）
+
+步骤2: 用户点击邮件链接 → POST /api/reset-password/identity/finish
+   ↓
+IdentityVerificationFinish 中间件校验 JWT
+   ↓
+校验通过 → ConsumeIdentityVerification → 设置 session.PasswordResetUsername
+   ↓
+返回 200
+
+步骤3: POST /api/reset-password（携带新密码）
+   ↓
+检查 session.PasswordResetUsername ≠ nil → 更新密码
+   ↓
+发送成功通知（失败也返回 200）
+   ↓
+返回 200
+```
+
+### 8.5 扩展点
 
 如果需要增加新的通知通道（如 Webhook、钉钉、企业微信等），只需：
 
@@ -646,3 +944,12 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
 2. 在配置 schema 中添加新的配置项
 3. 在配置验证器中添加验证逻辑
 4. 在 `NewProviders()` 中添加初始化分支
+
+### 8.6 代码优化建议
+
+针对「先落库后发通知」的一致性问题，建议考虑：
+
+1. **添加补偿逻辑**：通知发送失败时，异步删除或失效已保存的验证记录
+2. **后台重试机制**：通知失败不直接返回错误，而是放入队列后台重试
+3. **清理任务**：增加定时任务清理过期的验证记录，减少僵尸数据
+4. **优化错误提示**：通知失败时告诉用户"邮件发送可能延迟，请稍候或重试"，而不是笼统的"操作失败"
