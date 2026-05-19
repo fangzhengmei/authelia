@@ -81,66 +81,210 @@ case config.Notifier.FileSystem != nil:
 
 ---
 
-## 三、触发时机与调用链
+## 三、通知触发链路详细分析
 
-通知在认证流程中的多个关键点被触发，主要通过 `ctx.Providers.Notifier.Send()` 调用。
+通知在认证流程中的多个关键点被触发，所有通知最终都通过 `ctx.Providers.Notifier.Send()` 调用。
 
-### 3.1 密码重置流程
+每个场景我将按以下结构分析：
+- **发起方**：谁发起的 HTTP 请求
+- **路由入口**：API 端点定义
+- **处理链**：经过哪些中间件和 Handler
+- **通知调用点**：具体哪行代码调用 `Notifier.Send()`
+- **失败策略**：发送失败后是阻断流程还是继续
 
-#### 3.1.1 发送重置链接
-**位置：** `internal/middlewares/identity_verification.go:129`
+---
 
+### 3.1 场景一：密码重置 - 发送重置链接
+
+#### 完整调用链路
+
+```
+用户点击"忘记密码"
+    ↓
+前端 POST /api/reset-password/identity/start
+    ↓
+路由匹配: handlers.go:267
+    ↓
+中间件链: RateLimit → ResetPasswordIdentityStart
+    ↓
+Handler 调用: middlewares.IdentityVerificationStart()
+    ↓
+生成 JWT 令牌并保存到 Storage
+    ↓
+✅ 调用 Notifier.Send() 发送验证邮件
+    ↓
+返回 200 OK（无论用户是否存在，防止枚举攻击）
+```
+
+#### 逐段详细说明
+
+**1. 发起方：** 用户在登录页面点击"忘记密码"，输入用户名后前端发起请求
+
+**2. 路由入口**（`internal/server/handlers.go:267`）：
 ```go
-// 在 IdentityVerificationStart 中间件中
+r.POST("/api/reset-password/identity/start", 
+    middlewareAPI(
+        middlewares.NewRateLimitHandler(
+            config.Server.Endpoints.RateLimits.ResetPasswordStart, 
+            handlers.ResetPasswordIdentityStart
+        )
+    )
+)
+```
+
+**3. Handler 定义**（`internal/handlers/handler_reset_password.go:257-265`）：
+```go
+var ResetPasswordIdentityStart = middlewares.IdentityVerificationStart(
+    middlewares.IdentityVerificationStartArgs{
+        MailTitle:               "Reset your password",
+        MailButtonContent:       "Reset",
+        TargetEndpoint:          "/reset-password/step2",
+        ActionClaim:             ActionResetPassword,
+        IdentityRetrieverFunc:   identityRetrieverFromStorage,  // 从存储获取用户邮箱
+    }, 
+    middlewares.TimingAttackDelay(10, 250, 85, time.Millisecond*500, false)
+)
+```
+
+**4. 通知调用点**（`internal/middlewares/identity_verification.go:129`）：
+```go
+// 这是通用的身份验证启动中间件
 if err = ctx.Providers.Notifier.Send(
     ctx, 
-    identity.Address(), 
-    args.MailTitle, 
+    identity.Address(),           // 接收者邮箱
+    args.MailTitle,               // 邮件标题："Reset your password"
     ctx.Providers.Templates.GetIdentityVerificationJWTEmailTemplate(), 
-    data,
+    data,                         // 包含重置链接、用户名等
 ); err != nil {
-    ctx.Error(err, messageOperationFailed)
-    return
+    ctx.Error(err, messageOperationFailed)  // 返回 500 错误
+    return  // ❌ 阻断流程
 }
 ```
 
-**触发场景：** 用户请求密码重置时，发送包含 JWT 令牌的验证链接。
+**5. 失败策略：❌ 阻断流程**
+- 通知发送失败时，向用户返回操作失败错误
+- 原因：用户必须收到邮件才能继续重置流程
 
-#### 3.1.2 重置成功通知
-**位置：** `internal/handlers/handler_reset_password.go:223`
+---
 
+### 3.2 场景二：密码重置 - 重置成功通知
+
+#### 完整调用链路
+
+```
+用户点击邮件中的重置链接 → 进入重置页面
+    ↓
+用户输入新密码 → 前端 POST /api/reset-password
+    ↓
+路由匹配: handlers.go:270
+    ↓
+Handler: handlers.ResetPasswordPOST
+    ↓
+验证 JWT Token 有效性
+    ↓
+更新用户密码（调用 UserProvider.UpdatePassword）
+    ↓
+✅ 调用 Notifier.Send() 发送"密码已重置"通知
+    ↓
+返回 200 OK
+```
+
+#### 逐段详细说明
+
+**1. 发起方：** 用户在重置密码页面输入新密码后提交
+
+**2. 路由入口**（`internal/server/handlers.go:270`）：
 ```go
-// 密码重置成功后
+r.POST("/api/reset-password", middlewareAPI(handlers.ResetPasswordPOST))
+```
+
+**3. 通知调用点**（`internal/handlers/handler_reset_password.go:223`）：
+```go
+// 密码已经成功更新，现在发送通知
 data := templates.EmailEventValues{
     Title:       "Password changed successfully",
     DisplayName: userInfo.DisplayName,
     RemoteIP:    ctx.RemoteIP().String(),
     Details: map[string]any{"Action": "Password Reset"},
-    // ...
+    BodyPrefix: eventEmailActionPasswordModifyPrefix,
+    BodyEvent:  eventEmailActionPasswordReset,
+    BodySuffix: eventEmailActionPasswordModifySuffix,
 }
+
 if err = ctx.Providers.Notifier.Send(
-    ctx, addresses[0], 
+    ctx, 
+    addresses[0], 
     "Password changed successfully", 
     ctx.Providers.Templates.GetEventEmailTemplate(), 
     data,
 ); err != nil {
-    ctx.GetLogger().Error(err)
+    ctx.GetLogger().Error(err)  // ✅ 仅记录错误日志
+    ctx.ReplyOK()               // 仍返回 200 OK
+    return  // 不阻断，操作已完成
 }
 ```
 
-### 3.2 会话提升流程
+**4. 失败策略：✅ 容错继续**
+- 通知发送失败时，仅记录错误日志
+- 仍向用户返回操作成功
+- 原因：密码已经成功更新，通知只是事后告知，不应该因为通知失败而让用户困惑
 
-**位置：** `internal/handlers/handler_session_elevation.go:204`
+---
 
+### 3.3 场景三：会话提升 - 发送一次性验证码
+
+#### 完整调用链路
+
+```
+用户访问需要高权限的资源（如修改 2FA 设置）
+    ↓
+系统检测到需要提升会话 → 前端请求验证码
+    ↓
+前端 POST /api/user/session/elevation
+    ↓
+路由匹配: handlers.go:295
+    ↓
+中间件链: SecurityHeaders → RateLimit → Require1FA
+    ↓
+Handler: handlers.UserSessionElevationPOST
+    ↓
+生成 OneTimeCode 并保存到 Storage
+    ↓
+✅ 调用 Notifier.Send() 发送验证码邮件
+    ↓
+返回 200 OK（带撤销 ID）
+```
+
+#### 逐段详细说明
+
+**1. 发起方：** 用户访问敏感操作时，系统自动触发会话提升流程
+
+**2. 路由入口**（`internal/server/handlers.go:295`）：
 ```go
-// 创建一次性验证码后发送邮件
+middlewareElevatePOST := middlewares.NewBridgeBuilder(*config, providers).
+    WithPreMiddlewares(middlewares.SecurityHeadersBase, ...).
+    WithPostMiddlewares(
+        middlewares.NewRateLimit(config.Server.Endpoints.RateLimits.SessionElevationStart), 
+        middlewares.Require1FA,  // 需要先登录
+    ).Build()
+
+r.POST("/api/user/session/elevation", middlewareElevatePOST(handlers.UserSessionElevationPOST))
+```
+
+**3. 通知调用点**（`internal/handlers/handler_session_elevation.go:204`）：
+```go
 data := templates.EmailIdentityVerificationOTCValues{
-    Title:       "Confirm your identity",
-    OneTimeCode: string(otp.Code),
-    // ...
+    Title:              "Confirm your identity",
+    RevocationLinkURL:  linkURL.String(),
+    DisplayName:        identity.DisplayName,
+    RemoteIP:           ctx.RemoteIP().String(),
+    Domain:             domain,
+    OneTimeCode:        string(otp.Code),  // 6-8 位数字验证码
 }
+
 if err = ctx.Providers.Notifier.Send(
-    ctx, identity.Address(), 
+    ctx, 
+    identity.Address(), 
     data.Title, 
     ctx.Providers.Templates.GetIdentityVerificationOTCEmailTemplate(), 
     data,
@@ -148,46 +292,198 @@ if err = ctx.Providers.Notifier.Send(
     ctx.Logger.WithError(err).Error("error occurred sending the user the notification")
     ctx.SetStatusCode(fasthttp.StatusForbidden)
     ctx.SetJSONError(messageOperationFailed)
-    return
+    return  // ❌ 阻断流程
 }
 ```
 
-**触发场景：** 用户需要提升会话权限时（如访问敏感资源），发送一次性验证码。
+**4. 失败策略：❌ 阻断流程**
+- 通知发送失败时，返回 403 Forbidden
+- 原因：用户必须收到验证码才能完成提升，没有验证码无法继续
 
-### 3.3 密码修改通知
+---
 
-**位置：** `internal/handlers/handler_change_password.go:141`
+### 3.4 场景四：修改密码成功通知
 
+#### 完整调用链路
+
+```
+用户在设置页面修改密码
+    ↓
+前端 POST /api/change-password
+    ↓
+路由匹配: handlers.go:275
+    ↓
+中间件链: SecurityHeaders → RequireElevated
+    ↓
+Handler: handlers.ChangePasswordPOST
+    ↓
+验证旧密码 → 更新新密码
+    ↓
+✅ 调用 Notifier.Send() 发送"密码已修改"通知
+    ↓
+返回 200 OK
+```
+
+#### 逐段详细说明
+
+**1. 发起方：** 用户在账户设置页面主动修改密码
+
+**2. 路由入口**（`internal/server/handlers.go:275`）：
 ```go
-// 密码修改成功后发送通知
+if !config.AuthenticationBackend.PasswordChange.Disable {
+    r.POST("/api/change-password", middlewareElevated1FA(handlers.ChangePasswordPOST))
+}
+```
+注意：需要 `RequireElevated` 中间件，即用户必须已经通过会话提升
+
+**3. 通知调用点**（`internal/handlers/handler_change_password.go:141`）：
+```go
 data := templates.EmailEventValues{
     Title:       "Password changed successfully",
-    Details:     map[string]any{"Action": "Password Change"},
-    // ...
+    DisplayName: userInfo.DisplayName,
+    RemoteIP:    ctx.RemoteIP().String(),
+    Details: map[string]any{"Action": "Password Change"},
+    BodyPrefix: eventEmailActionPasswordModifyPrefix,
+    BodyEvent:  eventEmailActionPasswordChange,
+    BodySuffix: eventEmailActionPasswordModifySuffix,
 }
-if err = ctx.Providers.Notifier.Send(ctx, addresses[0], ...); err != nil {
+
+if err = ctx.Providers.Notifier.Send(
+    ctx, addresses[0], 
+    "Password changed successfully", 
+    ctx.Providers.Templates.GetEventEmailTemplate(), 
+    data,
+); err != nil {
     ctx.GetLogger().WithError(err).Debug("Unable to notify user of password change")
-    // 注意：即使通知失败，操作仍然成功
-    ctx.ReplyOK()
+    ctx.ReplyOK()  // ✅ 仍返回成功
     return
 }
 ```
 
-### 3.4 通用安全事件通知
+**4. 失败策略：✅ 容错继续**
+- 通知发送失败时，仅记录 Debug 日志
+- 仍向用户返回操作成功
+- 原因：密码已经成功修改，通知是安全提醒，不是流程必需
 
-**位置：** `internal/handlers/util.go:41-80`
+---
 
+### 3.5 场景五：2FA 设备变更通知（通用安全事件）
+
+#### 完整调用链路
+
+```
+用户添加/删除 WebAuthn 设备或 TOTP
+    ↓
+调用对应 Handler（如 WebAuthnRegistrationPOST）
+    ↓
+设备信息保存到 Storage
+    ↓
+调用 ctxLogEvent() 辅助函数
+    ↓
+✅ 内部调用 Notifier.Send() 发送事件通知
+    ↓
+返回 200 OK
+```
+
+#### 逐段详细说明
+
+**1. 发起方：** 用户在 2FA 设置页面添加或删除认证设备
+
+**2. 路由示例**（`internal/server/handlers.go:332`）：
 ```go
-func ctxLogEvent(ctx *middlewares.AutheliaCtx, username, description string, ...) {
-    // 获取用户信息...
-    if err = ctx.Providers.Notifier.Send(ctx, addresses[0], description, ...); err != nil {
+r.POST("/api/secondfactor/webauthn/credential/register", 
+    middlewareElevated1FA(handlers.WebAuthnRegistrationPOST))
+```
+
+**3. 通用通知函数**（`internal/handlers/util.go:41-80`）：
+```go
+func ctxLogEvent(ctx *middlewares.AutheliaCtx, username, description string, 
+    body emailEventBody, eventDetails map[string]any) {
+    
+    // 获取用户邮箱...
+    if details, err = ctx.Providers.UserProvider.GetDetails(username); err != nil {
+        ctx.Logger.WithError(err).Error(...)
+        return  // 获取用户信息失败，直接返回但不阻断主流程
+    }
+    
+    data := templates.EmailEventValues{
+        Title:       description,  // 如 "Second Factor Method Added"
+        DisplayName: details.DisplayName,
+        RemoteIP:    ctx.RemoteIP().String(),
+        Details:     eventDetails,
+        BodyPrefix:  body.Prefix,
+        BodyEvent:   body.Body,
+        BodySuffix:  body.Suffix,
+    }
+    
+    if err = ctx.Providers.Notifier.Send(
+        ctx, addresses[0], description, 
+        ctx.Providers.Templates.GetEventEmailTemplate(), data,
+    ); err != nil {
         ctx.Logger.WithError(err).Errorf("Error occurred sending notification")
-        return
+        return  // ✅ 记录错误，不影响主流程
     }
 }
 ```
 
-**使用场景：** 用于 2FA 设备添加/移除等安全事件通知。
+**4. 调用示例**（`internal/handlers/handler_register_webauthn.go:251`）：
+```go
+// WebAuthn 设备注册成功后
+ctxLogEvent(ctx, userSession.Username, eventLogAction2FAAdded, body, 
+    map[string]any{
+        eventLogKeyAction: eventLogAction2FAAdded,
+        eventLogKeyCategory: eventLogCategoryWebAuthnCredential,
+        eventLogKeyDescription: credential.Description,
+    })
+```
+
+**5. 失败策略：✅ 容错继续**
+- 通知发送失败时，仅记录错误日志
+- 设备添加/删除操作仍然成功
+- 原因：安全事件通知是额外的安全提醒，不应该影响用户的正常操作
+
+---
+
+### 3.6 通知触发场景汇总表
+
+| 场景 | 发起方 | API 端点 | 通知时机 | 失败策略 |
+|-----|-------|---------|---------|---------|
+| 发送密码重置链接 | 用户点击"忘记密码" | `POST /api/reset-password/identity/start` | 生成 JWT 后 | ❌ 阻断 |
+| 密码重置成功通知 | 用户提交新密码 | `POST /api/reset-password` | 密码更新后 | ✅ 继续 |
+| 会话提升验证码 | 访问敏感资源 | `POST /api/user/session/elevation` | 生成 OTC 后 | ❌ 阻断 |
+| 密码修改成功通知 | 用户修改密码 | `POST /api/change-password` | 密码更新后 | ✅ 继续 |
+| 2FA 设备添加通知 | 用户添加 2FA | 各 2FA 注册端点 | 设备保存后 | ✅ 继续 |
+| 2FA 设备删除通知 | 用户删除 2FA | 各 2FA 删除端点 | 设备删除后 | ✅ 继续 |
+
+---
+
+### 3.7 设计模式分析
+
+#### 两种失败策略的设计考量
+
+**❌ 阻断流程的场景（通知是流程的一部分）：**
+- 密码重置链接：没有邮件用户无法继续重置
+- 会话提升验证码：没有验证码用户无法提升权限
+- **共同点**：通知承载了后续流程必需的信息（链接/验证码）
+
+**✅ 容错继续的场景（通知是事后告知）：**
+- 密码修改/重置成功通知
+- 2FA 设备变更通知
+- **共同点**：主操作已完成，通知只是安全审计提醒
+
+#### 时序差异
+
+```
+阻断型时序（通知在流程中间）：
+请求 → 验证 → 生成令牌 → ✉️ 发送通知 → 存储 → 返回响应
+                                  ↓失败
+                                返回错误
+
+容错型时序（通知在流程末尾）：
+请求 → 验证 → 执行操作 → 存储 → ✉️ 发送通知 → 返回响应
+                                            ↓失败
+                                          记录日志，仍返回成功
+```
 
 ---
 
