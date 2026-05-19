@@ -355,23 +355,38 @@ Decode Hook 错误 → LoadAdvanced 收集 → ValidateKeys 收集 → ValidateC
 - **入口**: `internal/commands/context.go:437` → `NewDefaultSourcesWithDefaults()`
 - **发生的事**: 按优先级顺序构建配置源列表，**列表顺序决定了合并顺序**
 
-**配置源注入顺序与优先级（代码级准确）**:
+**配置源注入顺序与优先级（代码级准确，完整链路）**:
 
-| 顺序 | 源类型 | 构建位置 | 优先级 | 说明 |
-|-----|--------|---------|-------|------|
-| 1 | `MapSource(defaults)` | `sources.go:416` | 最低 | `defaults.go` 中的全局默认值 map |
-| 2 | `defaultSources[]` | `sources.go:418-420` | ↓ | 代码传入的额外默认值（如测试配置） |
-| 3 | `FileSource(配置文件)` | `sources.go:380-383` | ↓ | YAML 文件，多个文件按顺序追加 |
-| 4 | `EnvironmentSource` | `sources.go:385` | ↓ | `AUTHELIA_*` 环境变量 |
-| 5 | `SecretsSource` | `sources.go:386` | ↓ | `AUTHELIA_*_FILE` 指向的密钥文件 |
-| 6 | `additionalSources[]` | `sources.go:388-390` | 最高 | 命令行参数等附加来源 |
+```
+NewDefaultSourcesWithDefaults 构建过程：
+├─ 第 1 次添加：NewMapSource(defaults)          ← sources.go:416
+├─ 第 2 次添加：defaultSources[]                ← sources.go:418-420
+└─ 调用 NewDefaultSources()，内部依次添加：
+   ├─ 第 3 次添加：NewMapSource(defaults)       ← sources.go:378 ⚠️ defaults 被第二次添加！
+   ├─ 第 4 次添加：FileSource(配置文件)         ← sources.go:380-383
+   ├─ 第 5 次添加：EnvironmentSource            ← sources.go:385
+   ├─ 第 6 次添加：SecretsSource                ← sources.go:386
+   └─ 第 7 次添加：additionalSources[]          ← sources.go:388-390
+```
+
+**最终合并顺序（优先级从低到高）**:
+
+| 顺序 | 源类型 | 构建位置 | 覆盖规则 | 特殊说明 |
+|-----|--------|---------|---------|---------|
+| 1 | `MapSource(defaults)` | `sources.go:416` | 被所有后续源覆盖 | `defaults.go` 中的全局默认值 |
+| 2 | `defaultSources[]` | `sources.go:418-420` | 覆盖第 1 层 defaults | 代码传入的额外默认值 |
+| 3 | `MapSource(defaults)` | `sources.go:378` | 覆盖 defaultSources | **defaults 被第二次添加，会覆盖自定义 defaultSources** |
+| 4 | `FileSource(配置文件)` | `sources.go:380-383` | 覆盖 defaults | 多个文件按顺序追加，后加载覆盖先加载 |
+| 5 | `EnvironmentSource` | `sources.go:385` | 覆盖文件配置 | `AUTHELIA_*` 环境变量 |
+| 6 | `SecretsSource` | `sources.go:386` | 覆盖环境变量 | 密钥已被其他源定义会 Push 错误但仍覆盖 |
+| 7（最高） | `additionalSources[]` | `sources.go:388-390` | 覆盖所有其他源 | 命令行参数等附加来源 |
 
 **"后写覆盖前写"的实际位置**:
 
 ```go
 // internal/configuration/provider.go:150-167
 func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source) (err error) {
-    for _, source := range sources {          // 按列表顺序遍历
+    for _, source := range sources {          // 按列表顺序遍历，后序覆盖前序
         if err = source.Load(val); err != nil {
             continue
         }
@@ -550,10 +565,15 @@ func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source
 | 2 | 结构体 Default 变量 | `internal/configuration/schema/*.go` | 第 10 步 Validator 校验时 | `DefaultServerConfiguration` |
 | 3（最高） | Validator 动态填充 | `internal/configuration/validator/*.go` | 第 10 步 Validator 校验时 | `if config.Server.Address == nil { ... }` |
 
-> 💡 注意：`defaults` 数据实际存储在两个地方：
-> - `internal/configuration/defaults.go` - 大部分默认值
-> - `internal/configuration/const.go:86-91` 的 `mapDefaults` - webauthn.metadata 相关默认值
-> 两者都通过 `NewMapSource(defaults)` 合并到配置中。
+> 💡 注意：默认值数据实际存储在两个独立的 map 中，通过不同路径注入：
+> - `internal/configuration/defaults.go` 的 `defaults` 变量 - 大部分默认值
+>   - 注入路径：`NewDefaultSourcesWithDefaults()` → `NewMapSource(defaults)`（`sources.go:416`）
+> - `internal/configuration/const.go:86-91` 的 `mapDefaults` 变量 - webauthn.metadata 相关默认值
+>   - 注入路径：`NewDefaultsSource()` → `NewMapSource(mapDefaults)`（`sources.go:434-435`）
+>
+> 两者是**独立的默认值源**，`mapDefaults` 不会通过 `NewMapSource(defaults)` 注入，而是需要显式调用 `NewDefaultsSource()` 才能生效。
+>
+> ⚠️ 重要提示：在 `NewDefaultSourcesWithDefaults` 的标准调用链中，`NewDefaultsSource()` **没有被调用**，因此 `mapDefaults` 中的 webauthn.metadata 默认值**不会被自动加载**。只有当代码显式传入 `NewDefaultsSource()` 作为 `defaultSources` 参数时，这些默认值才会生效。
 
 ---
 
