@@ -13,17 +13,24 @@ Issuer 结构体
 ├─ kid: 默认签名密钥 ID (第一个 RS256 sig 密钥)
 └─ jwks: 完整 JWKS (含私钥)
         │
-        ├─────────────────────────────────┐
-        │                                 │
-        ▼                                 ▼
-令牌签发 (仅两类流程调用 GetKeyID)       JWKS 端点
-├─ 授权码流程 (authorization)         ├─ GetPublicJSONWebKeys
-├─ 设备授权流程 (device auth)         └─ jwk.Public() → 仅公钥
-├─ 刷新令牌流程 (refresh)
-└─ 客户端凭证流程 (client_credentials)
+        ├─────────────────────────────────────────┐
+        │                                         │
+        ▼                                         ▼
+令牌签发策略构造                              JWKS 端点
+├─ Strategy.JWT: jwt.DefaultStrategy          ├─ GetPublicJSONWebKeys
+├─ Strategy.Core: oauth2.CoreStrategy         └─ jwk.Public() → 仅公钥
+│  (由 JWTResponseAccessTokens 开关决定)
+└─ Strategy.OpenID: openid.DefaultStrategy
         │
-        ├─ GetKeyID(kid, alg) → 仅在创建 session 时调用
-        └─ oauth2 库内部签名 → 通过存储的 kid 查找私钥
+        ▼
+各授权流程
+├─ 授权码流程: GetKeyID (仅 ID Token)
+├─ 设备授权流程: GetKeyID (仅 ID Token)
+├─ 刷新令牌流程: 复用 session 中的 kid
+└─ 客户端凭证流程: 直接使用客户端配置
+        │
+        ├─ ID Token: 始终 JWT，用 JWKS 私钥签名
+        └─ Access Token: JWT (用 JWKS) 或 Opaque (用 HMAC)
 ```
 
 ## 二、密钥配置与初始化
@@ -236,7 +243,58 @@ session := oidc.NewSessionWithRequester(
 
 > **关键点**: 设备授权流程与授权码流程使用**完全相同**的密钥选择逻辑，都是为后续签发 ID Token 做准备。
 
-### 4.3 Token 端点：实际签发
+### 4.3 CoreStrategy 构造：JWT vs Opaque Token 的总开关
+
+**文件**: `internal/oidc/config.go:61-70`
+
+```go
+c.Strategy.JWT = &jwt.DefaultStrategy{
+    Config: c,
+    Issuer: issuer,
+}
+
+// 全局开关：JWTResponseAccessTokens 决定 CoreStrategy 是否支持 JWT Access Token
+if config.Discovery.JWTResponseAccessTokens {
+    c.Strategy.Core = oauth2.NewCoreStrategy(c, fmtAutheliaOpaqueOAuth2Token, c.Strategy.JWT)
+} else {
+    c.Strategy.Core = oauth2.NewCoreStrategy(c, fmtAutheliaOpaqueOAuth2Token, nil)
+}
+
+c.Strategy.OpenID = &openid.DefaultStrategy{
+    Strategy: c.Strategy.JWT,
+    Config:   c,
+}
+```
+
+**构造逻辑说明**:
+
+| 全局开关 `JWTResponseAccessTokens` | CoreStrategy 参数 | 能力 |
+|----------------------------------|------------------|------|
+| `true` | 传入 `c.Strategy.JWT` | 支持生成 JWT Access Token |
+| `false` | 传入 `nil` | 只能生成 Opaque Access Token |
+
+**常量定义**:
+- `fmtAutheliaOpaqueOAuth2Token` = `"authelia_%s_"`（Opaque token 前缀）
+- `fmtValueOAuth2AccessToken` = `"at"`（Access Token 类型标识）
+- Opaque token 完整前缀 = `"authelia_at_"`
+
+### 4.4 客户端级 JWT Access Token 开关
+
+**文件**: `internal/oidc/client.go:508-510`
+
+```go
+// GetEnableJWTProfileOAuthAccessTokens 返回是否启用 RFC9068 JWT Profile Access Token
+func (c *RegisteredClient) GetEnableJWTProfileOAuthAccessTokens() (enable bool) {
+    return c.GetAccessTokenSignedResponseAlg() != SigningAlgNone && 
+           len(c.GetAccessTokenSignedResponseKeyID()) > 0
+}
+```
+
+**启用条件**（必须同时满足）:
+1. `access_token_signed_response_alg` 不为 `none`（如配置为 `RS256`）
+2. `access_token_signed_response_key_id` 配置了非空的 kid
+
+### 4.5 Token 端点：两类令牌的签名路径
 
 **文件**: `internal/handlers/handler_oauth2_token.go:15-88`
 
@@ -244,12 +302,11 @@ session := oidc.NewSessionWithRequester(
 func OAuth2TokenPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *http.Request) {
     session := oidc.NewSessionWithRequestedAt(ctx.GetClock().Now())
 
-    // oauth2 库内部会根据 session 中存储的 kid 查找对应的私钥进行签名
     if requester, err = ctx.Providers.OpenIDConnect.NewAccessRequest(ctx, req, session); err != nil {
         // ...
     }
 
-    // 生成最终的令牌响应 (包含 ID Token / Access Token)
+    // 生成最终的令牌响应
     if responder, err = ctx.Providers.OpenIDConnect.NewAccessResponse(ctx, requester); err != nil {
         // ...
     }
@@ -258,13 +315,103 @@ func OAuth2TokenPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *
 }
 ```
 
-> **重要说明**: Token 端点本身**不调用** `GetKeyID`。kid 是在之前的授权流程（授权码/设备授权）中通过 `GetKeyID` 选择并注入到 session 的 JWT Header 中的。刷新令牌和客户端凭证流程复用已存储的 session 或直接使用默认密钥，不经过 `GetKeyID`。
+Token 端点本身**不调用** `GetKeyID`。实际签名路径分为两类：
 
-### 4.3.1 刷新令牌流程
+#### 4.5.1 ID Token 签名路径
 
-刷新令牌流程不经过 `GetKeyID`。oauth2 库从存储的 session 中读取之前已注入的 kid，直接用于签名。
+ID Token 始终使用 `Strategy.OpenID`（`openid.DefaultStrategy`），始终是 JWT 格式：
 
-### 4.3.2 客户端凭证流程
+```
+Strategy.OpenID (openid.DefaultStrategy)
+        │
+        ├─ Strategy: c.Strategy.JWT (jwt.DefaultStrategy)
+        └─ Config:   c
+```
+
+**ID Token 的 kid 来源**:
+- **授权码流程**：在 `handler_oauth2_authorization.go:147` 中通过 `GetKeyID(client.GetIDTokenSignedResponseKeyID(), client.GetIDTokenSignedResponseAlg())` 选择，注入 session.Headers
+- **设备授权流程**：在 `handler_oauth2_device_authorization.go:214` 中通过相同的 `GetKeyID` 选择，注入 session.Headers
+- **刷新令牌流程**：从存储的 session 中读取已有的 kid，不重新调用 `GetKeyID`
+- **客户端凭证流程**：不签发 ID Token（无用户身份）
+
+#### 4.5.2 Access Token 签名路径
+
+Access Token 使用 `Strategy.Core`（`oauth2.CoreStrategy`），可能是 JWT 或 Opaque：
+
+```
+Strategy.Core (oauth2.CoreStrategy)
+        │
+        ├─ 全局开关 JWTResponseAccessTokens: 是否传入了 jwtStrategy
+        └─ 客户端开关 GetEnableJWTProfileOAuthAccessTokens(): 是否配置了 alg+kid
+```
+
+**Access Token 类型判断逻辑**:
+
+| 全局开关 | 客户端开关 | Access Token 类型 | 签名密钥来源 |
+|---------|-----------|------------------|-------------|
+| `false` | 任意 | **Opaque Token** | HMAC-SHA256 (GlobalSecret) |
+| `true` | `false` | **Opaque Token** | HMAC-SHA256 (GlobalSecret) |
+| `true` | `true` | **JWT Token** | JWKS 中的私钥（通过 kid 查找） |
+
+**Opaque Token 格式**: `authelia_at_<random_token>.<hmac_signature>`
+
+**JWT Access Token 的 kid 来源**:
+- **授权码/设备授权流程**：使用 `client.GetAccessTokenSignedResponseKeyID()` 配置的 kid（若为空则回退默认）
+- **刷新令牌流程**：从存储的 session 中读取，或重新根据客户端配置选择
+- **客户端凭证流程**：使用 `client.GetAccessTokenSignedResponseKeyID()` 配置的 kid
+
+### 4.6 各授权流程的完整签名链路
+
+#### 4.6.1 授权码流程 (Authorization Code Flow)
+
+```
+授权请求到达 (handler_oauth2_authorization.go)
+    │
+    ├─ GetKeyID(client.IDTokenKid, client.IDTokenAlg) → kid_idtoken
+    ├─ kid_idtoken 注入 session.Headers (用于 ID Token)
+    └─ session 存入存储
+            │
+            ▼
+Token 端点 (handler_oauth2_token.go)
+    │
+    ├─ ID Token:
+    │   └─ Strategy.OpenID → 从 session.Headers 读取 kid_idtoken
+    │      └─ jwt.DefaultStrategy → 通过 kid 查找 JWKS 私钥签名
+    │
+    └─ Access Token:
+        └─ Strategy.Core → 检查全局+客户端开关
+           ├─ 开关关闭 → 生成 Opaque Token (HMAC 签名)
+           └─ 开关开启 → 使用 client.AccessTokenKid
+              └─ jwt.DefaultStrategy → 通过 kid 查找 JWKS 私钥签名
+```
+
+#### 4.6.2 设备授权流程 (Device Authorization Flow)
+
+与授权码流程**完全相同**：
+- 在 `handler_oauth2_device_authorization.go:214` 中调用 `GetKeyID` 选择 ID Token 的 kid
+- Token 端点的签名逻辑一致
+
+#### 4.6.3 刷新令牌流程 (Refresh Token Flow)
+
+```
+刷新令牌请求到达
+    │
+    ├─ 从存储读取原始 session（包含已注入的 kid_idtoken）
+    │
+    ├─ ID Token:
+    │   └─ Strategy.OpenID → 复用 session 中的 kid_idtoken
+    │      └─ 查找 JWKS 私钥签名（不调用 GetKeyID）
+    │
+    └─ Access Token:
+        └─ Strategy.Core → 检查全局+客户端开关
+           ├─ 开关关闭 → 生成新的 Opaque Token
+           └─ 开关开启 → 复用或重新选择 kid
+              └─ 查找 JWKS 私钥签名（不调用 GetKeyID）
+```
+
+**关键点**: 刷新令牌流程**不调用** `GetKeyID`，直接复用或重新根据配置查找密钥。
+
+#### 4.6.4 客户端凭证流程 (Client Credentials Flow)
 
 **文件**: `internal/oidc/util.go:284-309`
 
@@ -276,15 +423,30 @@ func HydrateClientCredentialsFlowSessionWithAccessRequest(ctx Context, client oa
     session.ClientID = client.GetID()
     session.Claims.Subject = client.GetID()
     session.Claims.Issuer = issuer.String()
-    // ...
-    // 注意：此处没有设置 kid，oauth2 库会使用默认密钥签名
+    // 注意：此处不注入任何 kid（无 ID Token）
     return nil
 }
 ```
 
-客户端凭证流程也不经过 `GetKeyID`。session 初始化时不会注入特定 kid，oauth2 库会使用默认签名密钥（第一个 RS256 sig 密钥）。
+```
+客户端凭证请求到达
+    │
+    ├─ HydrateClientCredentialsFlowSessionWithAccessRequest()
+    │   └─ 初始化 session，不注入 kid（无 ID Token）
+    │
+    └─ Access Token:
+        └─ Strategy.Core → 检查全局+客户端开关
+           ├─ 开关关闭 → 生成 Opaque Token (HMAC 签名)
+           └─ 开关开启 → 使用 client.AccessTokenKid
+              └─ jwt.DefaultStrategy → 通过 kid 查找 JWKS 私钥签名
+```
 
-### 4.4 GetKeyID 解析逻辑
+**关键点**:
+- 不签发 ID Token（无用户身份）
+- 不调用 `GetKeyID`
+- Access Token 的 kid 直接来自客户端配置 `access_token_signed_response_key_id`
+
+### 4.7 GetKeyID 解析逻辑（仅 ID Token 使用）
 
 **文件**: `internal/oidc/issuer.go:81-87`
 
@@ -418,10 +580,13 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 │  ├─ JSONWebKeys: []JWK              (新配置，推荐)                            │
 │  │  (配置时 Key 为 Base64 PEM 字符串)                                         │
 │  ├─ IssuerPrivateKey: *rsa.PrivateKey (旧配置，兼容)                           │
-│  └─ IssuerCertificateChain: X509Chain   (旧配置，可选)                         │
+│  ├─ IssuerCertificateChain: X509Chain   (旧配置，可选)                         │
+│  ├─ Discovery.JWTResponseAccessTokens: bool (全局 JWT AT 开关)                 │
+│  └─ HMACSecret: string (用于 Opaque token)                                    │
 │                                    ↓                                          │
 │  配置解析与验证                                                               │
 │  ├─ PEM 字符串 → 解析为 Go crypto 类型 (*rsa.PrivateKey / *ecdsa.PrivateKey)  │
+│  ├─ HMACSecret → SHA256 哈希为 GlobalSecret                                   │
 │  └─ validateOIDCIssuer()                                                     │
 │     ├─ 互斥校验：不能同时配置新旧方式                                          │
 │     ├─ 旧配置转换：IssuerPrivateKey → 包装为 JWK                              │
@@ -430,9 +595,11 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 │        ├─ 按 use 分类 (sig / enc)                                            │
 │        └─ 收集算法信息到 Discovery                                            │
 │                                    ↓                                          │
-│  NewIssuer(keys)                                                             │
-│  ├─ jwks: NewJSONWebKeySet(keys)  → 内存私钥集合 (*jose.JSONWebKeySet)        │
-│  └─ kid:  NewIssuerDefaultKeyID(keys) → 默认 RS256 签名密钥 ID                │
+│  NewConfig(config, issuer, templates)                                         │
+│  ├─ Strategy.JWT: jwt.DefaultStrategy (关联 Issuer)                          │
+│  ├─ Strategy.Core: oauth2.CoreStrategy                                       │
+│  │  (JWTResponseAccessTokens ? 传入 JWT Strategy : nil)                       │
+│  └─ Strategy.OpenID: openid.DefaultStrategy (使用 JWT Strategy)               │
 └──────────────────────────────────────────────────────────────────────────────┘
                                     │
           ┌─────────────────────────┴─────────────────────────┐
@@ -444,36 +611,47 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 │  ┌─ 授权码流程 (authorization) ──┐                      │    ↓                │
 │  │  session 创建点             │                      │ GetPublicJSONWebKeys()│
 │  │    ↓                        │                      │    ↓                │
-│  │  GetKeyID(kid, alg)         │                      │ 遍历 i.jwks.Keys     │
+│  │  GetKeyID(IDTokenKid, IDTokenAlg)                │ 遍历 i.jwks.Keys     │
 │  │    ↓                        │                      │ 对每个 jwk 调用 Public()│
-│  │  kid 注入 JWT Header        │                      │    ↓                │
+│  │  kid 注入 session.Headers   │                      │    ↓                │
 │  └──────────────────────────────┘                      │ 返回仅含公钥的 JWKS   │
 │                                                          └──────────────────────┘
 │  ┌─ 设备授权流程 (device auth) ──┐
 │  │  session 创建点             │
 │  │    ↓                        │
-│  │  GetKeyID(kid, alg)         │
+│  │  GetKeyID(IDTokenKid, IDTokenAlg)
 │  │    ↓                        │
-│  │  kid 注入 JWT Header        │
+│  │  kid 注入 session.Headers   │
 │  └──────────────────────────────┘
 │
+│  Token 端点 (所有流程汇聚点)
+│    │
+│    ├─ ID Token 签名 (Strategy.OpenID)
+│    │  ├─ 从 session.Headers 读取 kid
+│    │  └─ jwt.DefaultStrategy → 通过 kid 查找 JWKS 私钥签名
+│    │
+│    └─ Access Token 签名 (Strategy.Core)
+│       ├─ 检查全局 JWTResponseAccessTokens 开关
+│       ├─ 检查客户端 GetEnableJWTProfileOAuthAccessTokens()
+│       ├─ 开关关闭 → 生成 Opaque Token (HMAC-SHA256, GlobalSecret)
+│       └─ 开关开启 → 生成 JWT Token
+│          └─ 使用 AccessTokenKid → jwt.DefaultStrategy → 查找 JWKS 私钥
+│
 │  ┌─ 刷新令牌流程 (refresh) ─────┐
-│  │  不调用 GetKeyID             │
-│  │  复用 session 中已有的 kid   │
+│  │  从存储读取 session           │
+│  │  不调用 GetKeyID              │
+│  │  ID Token: 复用已有 kid       │
+│  │  Access Token: 重新检查开关   │
 │  └──────────────────────────────┘
 │
 │  ┌─ 客户端凭证流程 (client_creds) ─┐
-│  │  不调用 GetKeyID                 │
-│  │  不注入特定 kid                  │
-│  │  oauth2 库使用默认密钥签名       │
+│  │  HydrateClientCredentialsFlow  │
+│  │  不调用 GetKeyID               │
+│  │  不签发 ID Token               │
+│  │  Access Token: 检查开关        │
 │  └──────────────────────────────┘
 │
-│  Token 端点
-│    ↓
-│  oauth2 库签名 JWT
-│  (通过 session 中的 kid 查找私钥)
-│    ↓
-│  返回签名后的令牌
+│  返回签名后的令牌 (ID Token + Access Token)
 └──────────────────────────┘
           │
           ▼
@@ -482,10 +660,11 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  1. 从 /.well-known/openid-configuration 获取 jwks_uri                        │
 │  2. 从 jwks_uri 下载公钥集合 (JWKS)                                           │
-│  3. 接收 JWT，从 Header 提取 kid                                              │
-│  4. 用 kid 在 JWKS 中查找对应公钥                                             │
-│  5. 用公钥验证 JWT 签名                                                       │
-│  6. 验证通过 → 信任令牌                                                       │
+│  3. 接收令牌:                                                                 │
+│     ├─ ID Token: 始终 JWT → 从 Header 提取 kid → 匹配 JWKS 公钥验签            │
+│     ├─ JWT Access Token: 从 Header 提取 kid → 匹配 JWKS 公钥验签              │
+│     └─ Opaque Access Token: 发送到 introspection 端点验证 (服务端查存储)       │
+│  4. 验证通过 → 信任令牌                                                       │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -496,16 +675,45 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 | 层级 | 密钥类型 | 访问范围 | 用途 |
 |------|---------|---------|------|
 | 配置文件 | 私钥 (Base64 PEM 字符串) | 管理员 | 配置签名密钥 |
-| 内存 `Issuer.jwks` | 私钥 + 公钥 (Go crypto 类型: `*rsa.PrivateKey` / `*ecdsa.PrivateKey` 等) | Authelia 服务内部 | 签发令牌时签名 |
-| JWKS 端点响应 | 仅公钥 (JWK 格式 JSON) | 外部公开 | 客户端验证签名 |
+| 内存 `Issuer.jwks` | 私钥 + 公钥 (Go crypto 类型: `*rsa.PrivateKey` / `*ecdsa.PrivateKey` 等) | Authelia 服务内部 | 签发 JWT 令牌时签名 |
+| 内存 `GlobalSecret` | HMAC 密钥 (SHA-256 哈希) | Authelia 服务内部 | 签发 Opaque Access Token 时签名 |
+| JWKS 端点响应 | 仅公钥 (JWK 格式 JSON) | 外部公开 | 客户端验证 JWT 签名 |
 
-### 7.2 密钥选择优先级
+### 7.2 两层开关控制 Access Token 类型
+
+| 层级 | 配置项 | 说明 |
+|------|--------|------|
+| 全局 | `discovery.jwt_response_access_tokens` | 控制 CoreStrategy 是否传入 JWT Strategy，决定系统是否支持 JWT Access Token |
+| 客户端 | `access_token_signed_response_alg` + `access_token_signed_response_key_id` | 控制单个客户端是否使用 JWT Access Token |
+
+**开关组合结果**:
+
+| 全局开关 | 客户端配置 | Access Token 类型 | 签名密钥 |
+|---------|-----------|------------------|---------|
+| `false` | 任意 | Opaque | GlobalSecret (HMAC-SHA256) |
+| `true` | alg=none 或 kid 为空 | Opaque | GlobalSecret (HMAC-SHA256) |
+| `true` | alg=RS256 且 kid 已配置 | JWT | JWKS 中的对应私钥 |
+
+### 7.3 GetKeyID 的适用范围
+
+`GetKeyID` 仅在**创建 session 时**为 **ID Token** 选择密钥：
+
+| 授权流程 | 是否调用 GetKeyID | kid 用途 |
+|---------|------------------|---------|
+| 授权码流程 | ✅ 是 | 选择 ID Token 的签名密钥 |
+| 设备授权流程 | ✅ 是 | 选择 ID Token 的签名密钥 |
+| 刷新令牌流程 | ❌ 否 | 复用 session 中已有的 kid |
+| 客户端凭证流程 | ❌ 否 | 不签发 ID Token |
+
+> Access Token 的密钥选择由 oauth2 库内部根据客户端配置直接处理，不经过 `GetKeyID`。
+
+### 7.4 密钥选择优先级（ID Token）
 
 1. **客户端指定 kid 优先**: 如果客户端配置了 `id_token_signed_response_key_id`，且能在密钥集合中找到匹配项，则使用该密钥
 2. **客户端指定 alg 匹配**: 如果只配置了 `id_token_signed_response_alg`，则选择第一个匹配该算法的签名密钥
 3. **默认回退**: 都不匹配时使用第一个 `use=sig` 且 `algorithm=RS256` 的密钥
 
-### 7.3 多密钥与密钥轮换
+### 7.5 多密钥与密钥轮换
 
 - 支持同时配置多个签名密钥
 - 每个密钥有唯一的 `kid`（自动生成或手动配置）
@@ -513,11 +721,12 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 - 所有公钥都在 JWKS 端点暴露，客户端通过 JWT Header 中的 kid 自动匹配
 - 密钥轮换：添加新密钥→逐步切换签发用的密钥→旧密钥保留在 JWKS 中直到所有旧令牌过期→最后移除旧密钥
 
-### 7.4 密钥用途区分
+### 7.6 密钥用途区分
 
-- `use=sig`: 用于签名（ID Token、Userinfo Response、Discovery Response 等）
+- `use=sig`: 用于签名（ID Token、JWT Access Token、Userinfo Response、Discovery Response 等）
 - `use=enc`: 用于加密（JWE 场景，如加密的 ID Token、Userinfo Response）
 - 验证时严格检查 `use` 字段，防止用签名密钥解密或用加密密钥验签
+- Opaque Access Token 不使用 JWKS，使用 HMAC 密钥单独签名
 
 ## 八、代码引用路径
 
@@ -535,6 +744,11 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 | 授权码流程密钥选择 | `internal/handlers/handler_oauth2_authorization.go` | 147 |
 | 设备授权流程密钥选择 | `internal/handlers/handler_oauth2_device_authorization.go` | 214 |
 | Token 端点签发 | `internal/handlers/handler_oauth2_token.go` | 15-88 |
+| 客户端凭证流程 session 初始化 | `internal/oidc/util.go` | 284-309 |
 | kid 注入 JWT Header | `internal/oidc/session.go` | 153-166 |
 | 发现文档 jwks_uri 构造 | `internal/oidc/provider.go` | 43, 60 |
+| CoreStrategy 构造（JWT/Opaque 开关） | `internal/oidc/config.go` | 61-70 |
+| 客户端 JWT Access Token 开关 | `internal/oidc/client.go` | 508-510 |
+| 客户端 Access Token kid/alg 获取 | `internal/oidc/client.go` | 306-323 |
 | JWK Schema | `internal/configuration/schema/shared.go` | 33-39 |
+| Opaque token 前缀常量 | `internal/oidc/const.go` | 26-31 |
