@@ -334,6 +334,204 @@ if err = ctx.Providers.Notifier.Send(
 
 ---
 
+### 3.2.1 深入：失败路径的 HTTP 状态语义分析
+
+很多开发者对失败时的 HTTP 状态码感到困惑。让我们从底层实现分析：
+
+**响应方法实现**（`internal/middlewares/authelia_context.go:76-87`）：
+```go
+// Error reply with an error and display the stack trace in the logs.
+func (ctx *AutheliaCtx) Error(err error, message string) {
+    ctx.SetJSONError(message)  // 调用 SetJSONError
+    ctx.Logger.Error(err)      // 记录日志
+}
+
+// SetJSONError sets the body of the response to an JSON error KO message.
+func (ctx *AutheliaCtx) SetJSONError(message string) {
+    // 注意：statusCode=0 表示不修改 HTTP 状态码！
+    if err := ctx.ReplyJSON(ErrorResponse{Status: "KO", Message: message}, 0); err != nil {
+        ctx.Logger.Error(err)
+    }
+}
+
+// ReplyJSON writes a JSON response.
+func (ctx *AutheliaCtx) ReplyJSON(data any, statusCode int) (err error) {
+    // ...
+    if statusCode > 0 {  // 只有 statusCode > 0 才会设置状态码
+        ctx.SetStatusCode(statusCode)
+    }
+    // ...
+}
+```
+
+**重要发现**：
+- `ctx.Error()` 和 `ctx.SetJSONError()` 都**不会修改 HTTP 状态码**
+- 默认 HTTP 状态码保持为 **200 OK**
+- 错误信息通过 JSON body 中的 `{"status":"KO","message":"..."}` 传递
+- 只有显式调用 `ctx.SetStatusCode()` 才会改变状态码（如会话提升场景的 403）
+
+**密码重置启动场景的完整响应分析**（`identity_verification.go`）：
+
+| 失败场景 | 调用方法 | HTTP 状态码 | JSON Body |
+|---------|---------|-----------|-----------|
+| 用户不存在 | `ctx.ReplyOK()` | 200 OK | `{"status":"OK"}` |
+| 生成 UUID 失败 | `ctx.Error(err, "Operation failed.")` | 200 OK | `{"status":"KO","message":"Operation failed."}` |
+| 存储令牌失败 | `ctx.Error(err, "Operation failed.")` | 200 OK | `{"status":"KO","message":"Operation failed."}` |
+| 发送通知失败 | `ctx.Error(err, "Operation failed.")` | 200 OK | `{"status":"KO","message":"Operation failed."}` |
+| 全部成功 | `ctx.ReplyOK()` | 200 OK | `{"status":"OK"}` |
+
+> **反直觉设计**：除了用户不存在返回 `{"status":"OK"}` 外，其他所有失败也都返回 **HTTP 200**，只是 JSON body 中 `status` 字段为 `"KO"`。
+>
+> 这意味着：**不能通过 HTTP 状态码判断操作是否成功，必须检查 JSON body 中的 `status` 字段！**
+
+**会话提升场景的响应差异**（`handler_session_elevation.go`）：
+```go
+if err = ctx.Providers.Notifier.Send(...); err != nil {
+    ctx.Logger.WithError(err).Error("error occurred sending the user the notification")
+    ctx.SetStatusCode(fasthttp.StatusForbidden)  // ✅ 显式设置 403
+    ctx.SetJSONError(messageOperationFailed)
+    return
+}
+```
+
+| 失败场景 | HTTP 状态码 | JSON Body |
+|---------|-----------|-----------|
+| 通知发送失败 | 403 Forbidden | `{"status":"KO","message":"Operation failed."}` |
+
+> 为什么会话提升用 403 而密码重置用 200？因为会话提升时用户已经登录，不需要担心枚举攻击。
+
+---
+
+### 3.2.2 深入：同用户重试时旧令牌的有效性
+
+**问题**：用户点击"忘记密码"多次，每次都生成新令牌。旧令牌会失效吗？
+
+**代码分析**：
+
+1. **生成新令牌**（`identity_verification.go:49-56`）：
+```go
+var jti uuid.UUID
+if jti, err = uuid.NewRandom(); err != nil {  // 每次生成新的 UUID
+    ctx.Error(err, messageOperationFailed)
+    return
+}
+// 新的 verification，不涉及旧记录
+verification := model.NewIdentityVerification(jti, identity.Username, ...)
+```
+
+2. **保存新令牌**（`sql_provider.go:953-961`）：
+```go
+func (p *SQLProvider) SaveIdentityVerification(ctx context.Context, verification model.IdentityVerification) (err error) {
+    // 只是 INSERT，没有 UPDATE 或 DELETE 旧记录
+    if _, err = p.db.ExecContext(ctx, p.sqlInsertIdentityVerification,
+        verification.JTI, verification.IssuedAt, ...); err != nil {
+        return err
+    }
+    return nil
+}
+```
+
+3. **校验令牌**（`sql_provider.go:982-1002`）：
+```go
+func (p *SQLProvider) FindIdentityVerification(ctx context.Context, jti string) (found bool, err error) {
+    // 只按 jti 查询单条记录，不检查同用户的其他令牌
+    if err = p.db.GetContext(ctx, &verification, p.sqlSelectIdentityVerification, jti); err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return false, nil
+        }
+        return false, err
+    }
+    // 检查当前令牌是否被撤销/消费/过期
+    switch {
+    case verification.RevokedAt.Valid: return false, ...
+    case verification.ConsumedAt.Valid: return false, ...
+    case verification.ExpiresAt.Before(time.Now()): return false, ...
+    default: return true, nil
+    }
+}
+```
+
+**结论**：
+- ✅ **旧令牌不会失效**！每次重试生成新的 JTI（UUID），旧记录仍然存在
+- ✅ 同用户可以同时存在**多个有效令牌**
+- ✅ 每个令牌独立检查，直到被消费、撤销或自然过期
+- ❌ 没有"同用户只保留最新令牌"的逻辑
+
+**实际影响**：
+- 用户点击了3次"发送重置邮件"，会收到3封邮件，包含3个不同的令牌链接
+- 这3个链接在过期前都有效
+- 用户点击其中一个链接并完成重置后，**只有被使用的那个令牌被标记为 consumed**
+- 另外2个令牌仍然有效，但无法再使用（因为密码已经被修改了，即使点击链接，修改密码时也需要用户输入新密码）
+
+---
+
+### 3.2.3 深入：先回包后保存 session 失败的可观察行为
+
+在 `resetPasswordIdentityVerificationFinish` 中，代码顺序是：
+
+```go
+// internal/handlers/handler_reset_password.go:267-286
+func resetPasswordIdentityVerificationFinish(ctx *middlewares.AutheliaCtx, username string) {
+    var (
+        userSession session.UserSession
+        err         error
+    )
+
+    ctx.ReplyOK()  // 👇 先返回 200 OK 给客户端！
+
+    // 👇 然后才尝试获取和保存 session
+    if userSession, err = ctx.GetSession(); err != nil {
+        ctx.GetLogger().WithError(err).Errorf("Unable to get session...")
+        return
+    }
+
+    userSession.PasswordResetUsername = &username
+
+    if err = ctx.SaveSession(userSession); err != nil {
+        ctx.GetLogger().WithError(err).Errorf("Unable to save session...")
+        // 注意：这里没有 return 之外的处理，用户已经收到响应了！
+    }
+}
+```
+
+**可观察行为分析**：
+
+| 阶段 | 服务端行为 | 客户端收到 | 用户感知 |
+|-----|-----------|-----------|---------|
+| 1 | 调用 `ctx.ReplyOK()` | HTTP 200 OK `{"status":"OK"}` | ✅ 验证成功，可以输入新密码 |
+| 2 | 尝试 `GetSession()` 失败 | 已发送，无法撤回 | 不知道后端失败了 |
+| 3 | 记录错误日志 | - | 无感知 |
+
+**后续用户操作的结果**：
+1. 用户看到"验证成功"，输入新密码并提交
+2. 前端发送 `POST /api/reset-password`
+3. `ResetPasswordPOST` 检查 `userSession.PasswordResetUsername`：
+```go
+// handler_reset_password.go:149-152
+if userSession.PasswordResetUsername == nil {
+    ctx.Error(fmt.Errorf("no identity verification process has been initiated"), 
+        messageUnableToResetPassword)
+    return
+}
+```
+4. 因为 session 保存失败，标记不存在，返回错误：`{"status":"KO","message":"Unable to reset password."}`
+
+**用户体验**：
+- 第一步："验证成功 ✓"
+- 第二步：输入新密码 → "无法重置密码 ✗"
+- 用户困惑：刚才不是说验证成功了吗？
+
+**问题根因**：
+- `ReplyOK()` 调用后，响应已经发送到网络
+- 后续的 session 操作失败无法通知用户
+- 这是"fire and forget"模式的典型问题
+
+**建议修复方向**：
+- 先保存 session，成功后再返回响应
+- 或者使用异步通知机制（如 WebSocket）告知用户最终状态
+
+---
+
 ### 3.3 场景三：会话提升 - 发送一次性验证码
 
 #### 完整调用链路
@@ -617,7 +815,42 @@ ctxLogEvent(ctx, userSession.Username, eventLogAction2FAAdded, body,
 
 ---
 
-### 3.7 设计模式分析
+### 3.7 关键代码行为速查表
+
+#### HTTP 状态码与 JSON 响应语义
+
+| 场景 | 成功 HTTP | 失败 HTTP | 成功 JSON | 失败 JSON |
+|-----|---------|---------|----------|----------|
+| 密码重置启动 | 200 | 200 | `{"status":"OK"}` | `{"status":"KO","message":"Operation failed."}` |
+| 密码重置令牌校验 | 200 | 200 | `{"status":"OK"}` | `{"status":"KO","message":"..."}` |
+| 密码重置完成 | 200 | 200 | `{"status":"OK"}` | `{"status":"KO","message":"..."}` |
+| 会话提升 | 200 | 403 | `{"deleteID":"..."}` | `{"status":"KO","message":"Operation failed."}` |
+
+> **统一规则**：密码重置相关接口**永远返回 HTTP 200**，必须检查 JSON body 中的 `status` 字段判断结果。
+
+#### 令牌有效性规则
+
+| 行为 | 是否有效 | 说明 |
+|-----|--------|-----|
+| 新令牌生成 | ✅ | 每次生成新 JTI，INSERT 新记录 |
+| 用户重试生成新令牌 | ✅ | 旧令牌仍然有效 |
+| 令牌被使用（Consume） | ❌ | `consumed` 字段被设置 |
+| 令牌过期 | ❌ | 过期时间已过 |
+| 令牌被撤销（Revoke） | ❌ | `revoked` 字段被设置 |
+
+> 同用户可以同时存在多个有效令牌，互不影响。
+
+#### Session 保存失败影响
+
+| 阶段 | 用户看到 | 实际状态 |
+|-----|--------|---------|
+| 令牌校验完成 | ✅ 验证成功 | session 可能没保存 |
+| 提交新密码 | ✗ 无法重置密码 | 标记不存在 |
+| 用户体验 | 困惑："验证成功了但改不了密码" | 需要重新走验证流程 |
+
+---
+
+### 3.8 设计模式分析
 
 #### 两种失败策略的设计考量
 
@@ -647,7 +880,7 @@ ctxLogEvent(ctx, userSession.Username, eventLogAction2FAAdded, body,
 
 ---
 
-### 3.8 先落库再发通知的深度分析
+### 3.9 先落库再发通知的深度分析
 
 #### 问题发现
 
@@ -880,9 +1113,9 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
 
 ---
 
-## 八、总结
+## 九、总结
 
-### 8.1 核心流程
+### 9.1 核心流程
 
 ```
 配置加载 → 配置验证 → 通知器初始化 → 启动检查 → 运行时触发发送
@@ -890,7 +1123,7 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
   读取配置   确保合法   创建SMTP/File   验证连通性    按场景失败处理
 ```
 
-### 8.2 关键设计决策
+### 9.2 关键设计决策
 
 1. **单通知通道设计**：同一时间只能使用一种通知通道，简化配置和维护
 2. **差异化失败处理**：关键操作阻断，非关键操作容错
@@ -899,7 +1132,7 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
 5. **先落库后发通知**：宁可产生僵尸记录，也不让用户收到无效验证码
 6. **用户枚举防护**：密码重置时用户不存在也返回 200，防止用户名枚举
 
-### 8.3 重要修正与发现
+### 9.3 重要修正与发现
 
 **之前分析的错误点及修正：**
 
@@ -909,8 +1142,11 @@ func (n *FileNotifier) Send(_ context.Context, recipient mail.Address, ...) (err
 | 密码重置启动失败都返回错误 | 用户不存在时固定返回 200 OK（防枚举） | `identity_verification.go:40-47` |
 | 通知失败时数据状态一致 | 先落库后发通知，失败时数据库中已有记录 | `identity_verification.go:82, 129` |
 | 会话提升通知失败无副作用 | OTC 已在数据库中，重试会生成新记录 | `handler_session_elevation.go:169, 204` |
+| HTTP 4xx/5xx 表示失败 | 密码重置接口永远返回 HTTP 200，需检查 JSON body 的 `status` 字段 | `authelia_context.go:76-87` |
+| 重试会让旧令牌失效 | 旧令牌仍然有效，同用户可同时存在多个有效令牌 | `sql_provider.go:953-1002` |
+| 先回包后保存 session 无影响 | session 保存失败会导致用户后续重置密码失败 | `handler_reset_password.go:267-286` |
 
-### 8.4 密码重置完整流程修正后
+### 9.4 密码重置完整流程修正后
 
 ```
 步骤1: POST /api/reset-password/identity/start
@@ -936,7 +1172,7 @@ IdentityVerificationFinish 中间件校验 JWT
 返回 200
 ```
 
-### 8.5 扩展点
+### 9.5 扩展点
 
 如果需要增加新的通知通道（如 Webhook、钉钉、企业微信等），只需：
 
@@ -945,7 +1181,7 @@ IdentityVerificationFinish 中间件校验 JWT
 3. 在配置验证器中添加验证逻辑
 4. 在 `NewProviders()` 中添加初始化分支
 
-### 8.6 代码优化建议
+### 9.6 代码优化建议
 
 针对「先落库后发通知」的一致性问题，建议考虑：
 
