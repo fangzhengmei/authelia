@@ -353,17 +353,39 @@ Decode Hook 错误 → LoadAdvanced 收集 → ValidateKeys 收集 → ValidateC
 
 #### 步骤 3：构建配置源列表
 - **入口**: `internal/commands/context.go:437` → `NewDefaultSourcesWithDefaults()`
-- **发生的事**: 按优先级顺序构建配置源列表：
-  ```
-  优先级从低到高：
-  1. MapSource(defaults)       ← 全局默认值（defaults.go）
-  2. 自定义 defaultSources     ← 代码传入的额外默认值
-  3. FileSource(配置文件)      ← YAML 文件配置
-  4. EnvironmentSource         ← 环境变量 AUTHELIA_*
-  5. SecretsSource             ← 密钥文件（通过环境变量指定路径）
-  6. 自定义 additionalSources  ← 命令行参数等
-  ```
-- **关键代码**: `internal/configuration/sources.go:414-429`
+- **发生的事**: 按优先级顺序构建配置源列表，**列表顺序决定了合并顺序**
+
+**配置源注入顺序与优先级（代码级准确）**:
+
+| 顺序 | 源类型 | 构建位置 | 优先级 | 说明 |
+|-----|--------|---------|-------|------|
+| 1 | `MapSource(defaults)` | `sources.go:416` | 最低 | `defaults.go` 中的全局默认值 map |
+| 2 | `defaultSources[]` | `sources.go:418-420` | ↓ | 代码传入的额外默认值（如测试配置） |
+| 3 | `FileSource(配置文件)` | `sources.go:380-383` | ↓ | YAML 文件，多个文件按顺序追加 |
+| 4 | `EnvironmentSource` | `sources.go:385` | ↓ | `AUTHELIA_*` 环境变量 |
+| 5 | `SecretsSource` | `sources.go:386` | ↓ | `AUTHELIA_*_FILE` 指向的密钥文件 |
+| 6 | `additionalSources[]` | `sources.go:388-390` | 最高 | 命令行参数等附加来源 |
+
+**"后写覆盖前写"的实际位置**:
+
+```go
+// internal/configuration/provider.go:150-167
+func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source) (err error) {
+    for _, source := range sources {          // 按列表顺序遍历
+        if err = source.Load(val); err != nil {
+            continue
+        }
+        if err = source.Merge(ko, val); err != nil {  // ← 覆盖发生在这里
+            continue
+        }
+    }
+    return nil
+}
+```
+
+- koanf 的 `Merge()` 方法会用新值覆盖已有键的值
+- **SecretsSource 的特殊保护**：`sources.go:303-313` 中，如果密钥对应的键已被其他源定义，会 Push 错误（"it's already defined in other configuration sources"），但仍会覆盖
+- 多个 FileSource 时，后加载的文件覆盖先加载的文件中的同键值
 
 #### 步骤 4：加载 Definitions（定义复用）
 - **入口**: `internal/commands/context.go:445` → `LoadDefinitions()`
