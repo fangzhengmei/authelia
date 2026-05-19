@@ -496,14 +496,64 @@ func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source
 
 ## 默认值优先级总表
 
-| 优先级 | 层级 | 位置 | 覆盖范围 | 示例 |
+### 配置源优先级（合并顺序，后写覆盖前写）
+
+**代码实际执行顺序**（`NewDefaultSourcesWithDefaults` → `NewDefaultSources`）：
+
+```
+sources.go:416 → 第 1 次添加 NewMapSource(defaults)
+sources.go:418-420 → 添加 defaultSources[]
+sources.go:423 → 调用 NewDefaultSources()，内部：
+    sources.go:378 → 第 2 次添加 NewMapSource(defaults)  ← 注意：defaults 被添加两次
+    sources.go:380-383 → 添加 FileSource(配置文件)
+    sources.go:385 → 添加 EnvironmentSource
+    sources.go:386 → 添加 SecretsSource
+    sources.go:388-390 → 添加 additionalSources[]
+```
+
+**最终合并顺序与优先级**：
+
+| 顺序 | 源类型 | 构建位置 | 优先级 | 覆盖规则 | 特殊说明 |
+|-----|--------|---------|-------|---------|---------|
+| 1 | `MapSource(defaults)` | `sources.go:416` | 最低 | 被所有后续源覆盖 | `defaults.go` 中的全局默认值 |
+| 2 | `defaultSources[]` | `sources.go:418-420` | ↓ | 覆盖第 1 层 defaults | 代码传入的额外默认值（如测试配置） |
+| 3 | `MapSource(defaults)` | `sources.go:378` | ↓ | 覆盖 defaultSources | **注意：defaults 被第二次添加，会覆盖 defaultSources** |
+| 4 | `FileSource(配置文件)` | `sources.go:380-383` | ↓ | 覆盖 defaults | 多个文件按顺序追加，后加载的文件覆盖先加载的 |
+| 5 | `EnvironmentSource` | `sources.go:385` | ↓ | 覆盖文件配置 | `AUTHELIA_*` 环境变量 |
+| 6 | `SecretsSource` | `sources.go:386` | ↓ | 覆盖环境变量 | `AUTHELIA_*_FILE` 指向的密钥文件，如密钥已被其他源定义会 Push 错误但仍覆盖 |
+| 7（最高） | `additionalSources[]` | `sources.go:388-390` | 最高 | 覆盖所有其他源 | 命令行参数等附加来源 |
+
+> ⚠️ 重要发现：`defaults` 在 `NewDefaultSourcesWithDefaults` 中被添加两次（第 1 层和第 3 层）。这意味着如果通过 `defaultSources` 参数传入自定义默认值，会被第 3 层的 `defaults` 覆盖！这是当前代码的一个设计特征。
+
+**"后写覆盖前写"发生位置**：`provider.go:150-167` 的 `loadSources()` 函数中，通过 for 循环按顺序调用 `source.Merge(ko, val)`，koanf 的 `Merge()` 方法用新值覆盖旧值。
+
+```go
+// internal/configuration/provider.go:150-167
+func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source) (err error) {
+    for _, source := range sources {          // 按列表顺序遍历，后序覆盖前序
+        if err = source.Load(val); err != nil {
+            continue
+        }
+        if err = source.Merge(ko, val); err != nil {  // ← 覆盖发生在这里
+            continue
+        }
+    }
+    return nil
+}
+```
+
+### 默认值填充优先级（Validator 内部）
+
+| 优先级 | 层级 | 位置 | 触发时机 | 示例 |
 |-------|------|------|---------|------|
-| 1（最低） | 全局 defaults 映射 | `internal/configuration/defaults.go` | 特定键路径 | `"regulation.max_retries": 3` |
-| 2 | 结构体 Default 变量 | `internal/configuration/schema/*.go` | 整个模块 | `DefaultServerConfiguration` |
-| 3 | Validator 动态填充 | `internal/configuration/validator/*.go` | 单字段 | `if config.Server.Address == nil { config.Server.Address = ... }` |
-| 4 | YAML 配置文件 | 用户提供的 configuration.yml | 用户配置 | `server: address: tcp://:9091/` |
-| 5 | 环境变量 | `AUTHELIA_*` 环境变量 | 单个键 | `AUTHELIA_SERVER_ADDRESS=tcp://:9091/` |
-| 6（最高） | 密钥文件 | `AUTHELIA_*_FILE` 指向的文件 | 敏感字段 | `AUTHELIA_SESSION_SECRET_FILE=/run/secrets/session_secret` |
+| 1（最低） | 全局 defaults 映射 | `internal/configuration/defaults.go` + `internal/configuration/const.go:86-91` | 第 5 步 Merge 时 | `"regulation.max_retries": 3` |
+| 2 | 结构体 Default 变量 | `internal/configuration/schema/*.go` | 第 10 步 Validator 校验时 | `DefaultServerConfiguration` |
+| 3（最高） | Validator 动态填充 | `internal/configuration/validator/*.go` | 第 10 步 Validator 校验时 | `if config.Server.Address == nil { ... }` |
+
+> 💡 注意：`defaults` 数据实际存储在两个地方：
+> - `internal/configuration/defaults.go` - 大部分默认值
+> - `internal/configuration/const.go:86-91` 的 `mapDefaults` - webauthn.metadata 相关默认值
+> 两者都通过 `NewMapSource(defaults)` 合并到配置中。
 
 ---
 
@@ -511,10 +561,20 @@ func loadSources(ko *koanf.Koanf, val *schema.StructValidator, sources ...Source
 
 ### 示例 1："configuration key not expected: server.unknown_field"
 
-**错误信息**:
+**错误信息（实际代码输出，硬编码字符串）**:
 ```
 Configuration: configuration key not expected: server.unknown_field
 ```
+
+**代码位置**：`internal/configuration/validator/keys.go:61`
+```go
+validator.Push(fmt.Errorf("configuration key not expected: %s", key))
+```
+
+**为什么会出现这条报错**：
+- 第 9 步 `ValidateKeys()` 检查所有加载的配置键是否在 `schema.Keys` 白名单中
+- 如果键名不在白名单中，且不是已废弃的键，则直接 Push 此错误
+- 这是配置验证中最严格的检查，确保用户没有拼写错误或使用已移除的配置项
 
 **排查路径**:
 1. **优先检查第 9 步（ValidateKeys）** - 这是未知键错误的唯一生成点
@@ -525,49 +585,75 @@ Configuration: configuration key not expected: server.unknown_field
 **为什么不是其他层**:
 - 不是 Schema 层：Schema 层只定义结构，不检查未知键
 - 不是 Decode Hooks：类型转换只处理已知类型
-- 不是 Validator：Validator 只校验已解析的字段
+- 不是 Validator 单字段校验：Validator 只校验已成功解析的字段
 
 ---
 
-### 示例 2："server: address 'tcp://invalid:port/' is invalid: port must be a number between 1 and 65535"
+### 示例 2："could not decode 'tcp://invalid:port/' to a *schema.AddressTCP: could not parse string 'tcp://invalid:port/' as address: expected format is [<scheme>://]<hostname>[:<port>]: parse \"tcp://invalid:port/\": invalid port \":port\" after host"
 
-**错误信息**:
+**错误信息（实际代码输出，来自 `errFmtDecodeHookCouldNotParse`）**:
 ```
-Configuration: server: address 'tcp://invalid:port/' is invalid: port must be a number between 1 and 65535
+Configuration: could not decode 'tcp://invalid:port/' to a *schema.AddressTCP: could not parse string 'tcp://invalid:port/' as address: expected format is [<scheme>://]<hostname>[:<port>]: parse "tcp://invalid:port/": invalid port ":port" after host
 ```
+
+**代码位置**：`internal/configuration/decode_hooks.go:412-413`
+```go
+if result, err = schema.NewAddressDefault(dataStr, schema.AddressSchemeTCP, schema.AddressSchemeUnix); err != nil {
+    return nil, fmt.Errorf(errFmtDecodeHookCouldNotParse, dataStr, prefixType, expectedType, err)
+}
+```
+
+**为什么会出现这条报错**：
+- `server.address` 字段类型是 `*schema.AddressTCP`
+- `StringToAddressHookFunc` 调用 `NewAddressDefault()`，内部调用标准库 `url.Parse()`
+- `url.Parse()` 在遇到 `:port` 这样的无效端口字符串时直接返回错误
+- Decode Hook 将原始错误包装后返回，形成完整的错误链
 
 **排查路径**:
-1. **优先检查第 7 步（Decode Hooks）还是第 10 步（Validator）**
-2. 看错误来源：`Address.ValidateHTTP()` → 这是在 `ValidateServerAddress` 中调用的 → **第 10 步**
-3. 检查配置文件中 `server.address` 的值
-4. 验证格式：`[scheme://][host]:port[/path]`
-5. 如果格式正确但端口是字符串 "port"，说明类型转换失败 → 回到 **第 7 步** 检查 `StringToAddressHookFunc`
+1. **直接定位第 7 步（Decode Hooks）** - 错误前缀 "could not decode" 是 Decode Hook 的典型特征
+2. 检查配置文件中 `server.address` 的值
+3. 端口部分必须是数字（1-65535），不能是字符串 "port"
 
-**为什么是 Validator 而非 Decode Hook**:
-- Decode Hook 阶段的 `StringToAddressHookFunc` 只做基本语法解析（`tcp://host:port` 格式正确就通过）
-- 端口范围检查是语义校验，在 Validator 层的 `ValidateServerAddress` → `Address.ValidateHTTP()` 中进行
+> ⚠️ 文档修正说明：原示例中 "port must be a number between 1 and 65535" 的错误信息实际是 `session.redis.port` 校验的文案（`validator/session.go:278-279`），与 `server.address` 无关。`server.address` 的端口错误由标准库 `url.Parse()` 抛出，没有范围检查。
 
 ---
 
-### 示例 3："option 'default_2fa_method' must be one of the enabled options [totp] but it's configured as 'webauthn'"
+### 示例 3："option 'default_2fa_method' must be one of the enabled options 'totp' but it's configured as 'webauthn'"
 
-**错误信息**:
+**错误信息（实际代码输出，来自 `errFmtInvalidDefault2FAMethodDisabled`）**:
 ```
-Configuration: option 'default_2fa_method' must be one of the enabled options [totp] but it's configured as 'webauthn'
+Configuration: option 'default_2fa_method' must be one of the enabled options 'totp' but it's configured as 'webauthn'
 ```
+
+**代码位置**：`internal/configuration/validator/configuration.go:104-105`
+```go
+if !utils.IsStringInSlice(config.Default2FAMethod, enabledMethods) {
+    validator.Push(fmt.Errorf(errFmtInvalidDefault2FAMethodDisabled, utils.StringJoinOr(enabledMethods), config.Default2FAMethod))
+}
+```
+
+**为什么会出现这条报错**：
+- `validateDefault2FAMethod()` **首先检查是否为空**，如果 `config.Default2FAMethod == ""` 则直接 `return`，不做任何处理
+- 只有当用户显式配置了 `default_2fa_method` 时，才会继续校验
+- 收集所有已启用的 2FA 方法（检查 `totp.disable`、`webauthn.disable`、`duo_api.disable`）
+- 检查 `default_2fa_method` 是否在已启用方法列表中
+- `utils.StringJoinOr()` 格式化输出：单个元素加单引号 `'totp'`，多个元素用 `'or'` 连接如 `'totp' or 'webauthn'`
 
 **排查路径**:
 1. **直接定位第 11 步（交叉字段约束）** - 这是典型的多字段校验错误
-2. 查看 `validateDefault2FAMethod` 函数逻辑
-3. 检查配置中：
-   - `default_2fa_method: webauthn`
+2. 检查配置中：
+   - `default_2fa_method: webauthn`（必须显式配置才会触发）
    - `webauthn.disable: true` 或 `webauthn` 未配置
-4. 修复：要么启用 webauthn，要么将 default_2fa_method 改为 totp
+3. 修复：要么启用 webauthn，要么将 default_2fa_method 改为 totp，要么删除该配置项
 
 **为什么是第 11 步**:
 - 需要同时读取 `default_2fa_method`、`totp.disable`、`webauthn.disable`、`duo_api.disable` 四个字段
 - 必须在单字段校验和默认值填充完成后，才能确定哪些方法已启用
 - 这是典型的"业务规则校验"而非"语法格式校验"
+
+> ⚠️ 文档修正说明 1：原示例中使用 `[totp]` 方括号格式错误，实际输出使用 `utils.StringJoinOr()` 函数，输出格式为带单引号的字符串列表。
+>
+> ⚠️ 文档修正说明 2：原描述遗漏了关键行为 —— **该函数不会填充默认值**。如果用户不配置 `default_2fa_method`，函数直接返回，字段保持空字符串。没有 `DefaultConfiguration.Default2FAMethod` 这样的默认值。
 
 ---
 
@@ -593,10 +679,25 @@ Configuration: option 'default_2fa_method' must be one of the enabled options [t
 ```
 配置错误发生时：
 ├─ 错误信息包含 "configuration key not expected" → 第 9 步 ValidateKeys
+├─ 错误信息包含 "could not decode" → 第 7 步 Decode Hooks
 ├─ 错误信息包含 "could not parse" → 第 7 步 Decode Hooks
+├─ 错误信息包含 "must be between" → 第 10 步 单字段范围校验
 ├─ 错误信息包含 "must be one of" 且只涉及单个字段 → 第 10 步 单字段语义校验
+├─ 错误信息包含 "enabled options" → 第 11 步 交叉字段约束
 ├─ 错误信息同时提到多个字段名 → 第 11 步 交叉字段约束
-├─ 配置值不生效 → 按优先级检查：环境变量 > 配置文件 > 默认值
+├─ 配置值不生效 → 按优先级检查：additionalSources > secrets > 环境变量 > 配置文件 > defaultSources > defaults
 ├─ YAML 语法错误 → 第 5 步 FileSource.Load
 └─ 启动后连接失败 → 第 13 步 Providers 初始化
 ```
+
+### 错误前缀速查表
+
+| 错误前缀 | 所在层级 | 典型原因 |
+|---------|---------|---------|
+| `configuration key not expected` | 第 9 步 | 配置了不存在的键名 |
+| `could not decode` | 第 7 步 | 类型转换失败（Decode Hook） |
+| `could not parse` | 第 7 步 | 格式解析失败（通常是 URL、正则、证书等） |
+| `server: option 'address'` | 第 10 步 | 服务器地址配置错误 |
+| `session: redis: option 'port'` | 第 10 步 | Redis 端口超出范围 |
+| `option 'default_2fa_method' must be one of the enabled options` | 第 11 步 | 默认 2FA 方法未启用 |
+| `secrets: error loading secret into key` | 第 5 步 | 密钥已在其他源定义 |
