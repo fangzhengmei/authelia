@@ -16,14 +16,14 @@ Issuer 结构体
         ├─────────────────────────────────┐
         │                                 │
         ▼                                 ▼
-令牌签发 (All Flows)                   JWKS 端点
+令牌签发 (仅两类流程调用 GetKeyID)       JWKS 端点
 ├─ 授权码流程 (authorization)         ├─ GetPublicJSONWebKeys
 ├─ 设备授权流程 (device auth)         └─ jwk.Public() → 仅公钥
 ├─ 刷新令牌流程 (refresh)
 └─ 客户端凭证流程 (client_credentials)
         │
-        ▼
-GetKeyID(kid, alg) → GetIssuerJWK → 私钥签名 JWT
+        ├─ GetKeyID(kid, alg) → 仅在创建 session 时调用
+        └─ oauth2 库内部签名 → 通过存储的 kid 查找私钥
 ```
 
 ## 二、密钥配置与初始化
@@ -37,7 +37,7 @@ type JWK struct {
     KeyID            string               // 密钥 ID
     Use              string               // 用途: "sig" (签名) / "enc" (加密)
     Algorithm        string               // 算法: RS256, ES256, PS256 等
-    Key              CryptographicKey     // 私钥材料 (PEM 格式)
+    Key              CryptographicKey     // 私钥材料 (配置时为 Base64 PEM 字符串，运行时解析为 Go crypto 类型: *rsa.PrivateKey / *ecdsa.PrivateKey 等)
     CertificateChain X509CertificateChain // 可选证书链
 }
 ```
@@ -244,7 +244,7 @@ session := oidc.NewSessionWithRequester(
 func OAuth2TokenPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *http.Request) {
     session := oidc.NewSessionWithRequestedAt(ctx.GetClock().Now())
 
-    // oauth2 库内部会根据之前存储的 kid 查找对应的私钥进行签名
+    // oauth2 库内部会根据 session 中存储的 kid 查找对应的私钥进行签名
     if requester, err = ctx.Providers.OpenIDConnect.NewAccessRequest(ctx, req, session); err != nil {
         // ...
     }
@@ -257,6 +257,32 @@ func OAuth2TokenPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *
     ctx.Providers.OpenIDConnect.WriteAccessResponse(ctx, rw, requester, responder)
 }
 ```
+
+> **重要说明**: Token 端点本身**不调用** `GetKeyID`。kid 是在之前的授权流程（授权码/设备授权）中通过 `GetKeyID` 选择并注入到 session 的 JWT Header 中的。刷新令牌和客户端凭证流程复用已存储的 session 或直接使用默认密钥，不经过 `GetKeyID`。
+
+### 4.3.1 刷新令牌流程
+
+刷新令牌流程不经过 `GetKeyID`。oauth2 库从存储的 session 中读取之前已注入的 kid，直接用于签名。
+
+### 4.3.2 客户端凭证流程
+
+**文件**: `internal/oidc/util.go:284-309`
+
+```go
+func HydrateClientCredentialsFlowSessionWithAccessRequest(ctx Context, client oauthelia2.Client, session *Session) (err error) {
+    InitializeSessionDefaults(session)
+
+    session.Subject = ""
+    session.ClientID = client.GetID()
+    session.Claims.Subject = client.GetID()
+    session.Claims.Issuer = issuer.String()
+    // ...
+    // 注意：此处没有设置 kid，oauth2 库会使用默认密钥签名
+    return nil
+}
+```
+
+客户端凭证流程也不经过 `GetKeyID`。session 初始化时不会注入特定 kid，oauth2 库会使用默认签名密钥（第一个 RS256 sig 密钥）。
 
 ### 4.4 GetKeyID 解析逻辑
 
@@ -303,7 +329,7 @@ func (i *Issuer) GetIssuerStrictJWK(ctx context.Context, kid, alg, use string) (
 ```
 
 **搜索逻辑**:
-- `i.jwks` 包含完整的私钥材料（来自配置文件的私钥）
+- `i.jwks` 包含完整的私钥材料（Go crypto 类型：`*rsa.PrivateKey` / `*ecdsa.PrivateKey` 等）
 - `jwt.SearchJWKS` 从私钥集合中按 kid + alg + use 条件查找
 - 找到的密钥（含私钥）被 oauth2 库用于实际的 JWT 签名操作
 
@@ -390,16 +416,19 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  config.IdentityProviders.OIDC                                               │
 │  ├─ JSONWebKeys: []JWK              (新配置，推荐)                            │
+│  │  (配置时 Key 为 Base64 PEM 字符串)                                         │
 │  ├─ IssuerPrivateKey: *rsa.PrivateKey (旧配置，兼容)                           │
 │  └─ IssuerCertificateChain: X509Chain   (旧配置，可选)                         │
 │                                    ↓                                          │
-│  validateOIDCIssuer()                                                        │
-│  ├─ 互斥校验：不能同时配置新旧方式                                              │
-│  ├─ 旧配置转换：IssuerPrivateKey → 包装为 JWK                                  │
-│  └─ 验证 JWK 列表                                                             │
-│     ├─ 自动生成 kid (如果未配置)                                               │
-│     ├─ 按 use 分类 (sig / enc)                                                │
-│     └─ 收集算法信息到 Discovery                                                │
+│  配置解析与验证                                                               │
+│  ├─ PEM 字符串 → 解析为 Go crypto 类型 (*rsa.PrivateKey / *ecdsa.PrivateKey)  │
+│  └─ validateOIDCIssuer()                                                     │
+│     ├─ 互斥校验：不能同时配置新旧方式                                          │
+│     ├─ 旧配置转换：IssuerPrivateKey → 包装为 JWK                              │
+│     └─ 验证 JWK 列表                                                         │
+│        ├─ 自动生成 kid (如果未配置)                                           │
+│        ├─ 按 use 分类 (sig / enc)                                            │
+│        └─ 收集算法信息到 Discovery                                            │
 │                                    ↓                                          │
 │  NewIssuer(keys)                                                             │
 │  ├─ jwks: NewJSONWebKeySet(keys)  → 内存私钥集合 (*jose.JSONWebKeySet)        │
@@ -411,20 +440,40 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 ┌──────────────────────────┐                      ┌──────────────────────────┐
 │      令牌签发路径         │                      │      JWKS 端点路径        │
 ├──────────────────────────┤                      ├──────────────────────────┤
-│  任意授权流程到达         │                      │ GET /jwks.json            │
-│  session 创建点           │                      │    ↓                      │
-│    ↓                     │                      │ GetPublicJSONWebKeys()    │
-│  GetKeyID(kid, alg)      │                      │    ↓                      │
-│    ↓                     │                      │ 遍历 i.jwks.Keys         │
-│  匹配成功 → 使用指定 kid  │                      │ 对每个 jwk 调用 Public() │
-│  匹配失败 → 使用默认 kid  │                      │    ↓                      │
-│    ↓                     │                      │ 返回仅含公钥的 JWKS       │
-│  kid 注入 JWT Header     │                      └──────────────────────────┘
-│    ↓                     │
-│  oauth2 库签名 JWT        │
-│  (通过 kid 查找私钥)      │
-│    ↓                     │
-│  返回签名后的令牌         │
+│                                                          │ GET /jwks.json      │
+│  ┌─ 授权码流程 (authorization) ──┐                      │    ↓                │
+│  │  session 创建点             │                      │ GetPublicJSONWebKeys()│
+│  │    ↓                        │                      │    ↓                │
+│  │  GetKeyID(kid, alg)         │                      │ 遍历 i.jwks.Keys     │
+│  │    ↓                        │                      │ 对每个 jwk 调用 Public()│
+│  │  kid 注入 JWT Header        │                      │    ↓                │
+│  └──────────────────────────────┘                      │ 返回仅含公钥的 JWKS   │
+│                                                          └──────────────────────┘
+│  ┌─ 设备授权流程 (device auth) ──┐
+│  │  session 创建点             │
+│  │    ↓                        │
+│  │  GetKeyID(kid, alg)         │
+│  │    ↓                        │
+│  │  kid 注入 JWT Header        │
+│  └──────────────────────────────┘
+│
+│  ┌─ 刷新令牌流程 (refresh) ─────┐
+│  │  不调用 GetKeyID             │
+│  │  复用 session 中已有的 kid   │
+│  └──────────────────────────────┘
+│
+│  ┌─ 客户端凭证流程 (client_creds) ─┐
+│  │  不调用 GetKeyID                 │
+│  │  不注入特定 kid                  │
+│  │  oauth2 库使用默认密钥签名       │
+│  └──────────────────────────────┘
+│
+│  Token 端点
+│    ↓
+│  oauth2 库签名 JWT
+│  (通过 session 中的 kid 查找私钥)
+│    ↓
+│  返回签名后的令牌
 └──────────────────────────┘
           │
           ▼
@@ -446,9 +495,9 @@ func (p *OpenIDConnectProvider) GetOpenIDConnectWellKnownConfiguration(issuer st
 
 | 层级 | 密钥类型 | 访问范围 | 用途 |
 |------|---------|---------|------|
-| 配置文件 | 私钥 (PEM 格式) | 管理员 | 配置签名密钥 |
-| 内存 `Issuer.jwks` | 私钥 + 公钥 (Go 类型) | Authelia 服务内部 | 签发令牌时签名 |
-| JWKS 端点响应 | 仅公钥 (JWK 格式) | 外部公开 | 客户端验证签名 |
+| 配置文件 | 私钥 (Base64 PEM 字符串) | 管理员 | 配置签名密钥 |
+| 内存 `Issuer.jwks` | 私钥 + 公钥 (Go crypto 类型: `*rsa.PrivateKey` / `*ecdsa.PrivateKey` 等) | Authelia 服务内部 | 签发令牌时签名 |
+| JWKS 端点响应 | 仅公钥 (JWK 格式 JSON) | 外部公开 | 客户端验证签名 |
 
 ### 7.2 密钥选择优先级
 
