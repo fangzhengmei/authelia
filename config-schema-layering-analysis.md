@@ -332,3 +332,249 @@ Decode Hook 错误 → LoadAdvanced 收集 → ValidateKeys 收集 → ValidateC
 | 默认值层 | `Defaults()` | `internal/configuration/defaults.go` |
 | 配置加载 | `Load()`, `LoadAdvanced()` | `internal/configuration/provider.go` |
 | 运行时分发 | `LoadProviders()` | `internal/commands/context.go` |
+
+---
+
+## 配置加载时间顺序详解
+
+从启动命令到运行时组件，配置经历以下 **14 个步骤**，每一步的职责和可能的错误类型明确区分：
+
+### 阶段一：初始化与配置源构建（步骤 1-4）
+
+#### 步骤 1：命令行上下文初始化
+- **入口**: `cmd/authelia/main.go:10` → `commands.NewRootCmd()`
+- **发生的事**: 创建 `CmdCtx`，初始化空的 `schema.Configuration{}` 对象和 `StructValidator`
+- **默认值**: 此时配置对象全为零值
+
+#### 步骤 2：配置文件存在性检查
+- **入口**: `internal/commands/root.go:29` → `ConfigEnsureExistsRunE`
+- **发生的事**: 检查配置文件是否存在，不存在则生成默认配置
+- **错误类型**: 文件系统错误
+
+#### 步骤 3：构建配置源列表
+- **入口**: `internal/commands/context.go:437` → `NewDefaultSourcesWithDefaults()`
+- **发生的事**: 按优先级顺序构建配置源列表：
+  ```
+  优先级从低到高：
+  1. MapSource(defaults)       ← 全局默认值（defaults.go）
+  2. 自定义 defaultSources     ← 代码传入的额外默认值
+  3. FileSource(配置文件)      ← YAML 文件配置
+  4. EnvironmentSource         ← 环境变量 AUTHELIA_*
+  5. SecretsSource             ← 密钥文件（通过环境变量指定路径）
+  6. 自定义 additionalSources  ← 命令行参数等
+  ```
+- **关键代码**: `internal/configuration/sources.go:414-429`
+
+#### 步骤 4：加载 Definitions（定义复用）
+- **入口**: `internal/commands/context.go:445` → `LoadDefinitions()`
+- **发生的事**: 先加载配置中的 `definitions` 部分，用于后续解析引用（如网络组别名）
+- **默认值**: 无，完全来自配置
+
+### 阶段二：配置加载与解码（步骤 5-8）
+
+#### 步骤 5：各配置源独立加载
+- **入口**: `internal/configuration/provider.go:150-167` → `loadSources()`
+- **发生的事**: 遍历所有 Source，调用 `source.Load()` 和 `source.Merge()`
+  - FileSource: 读取 YAML 文件，通过 yaml.Parser 解析到 koanf
+  - EnvironmentSource: 读取环境变量，按前缀映射到配置键
+  - SecretsSource: 读取环境变量指向的文件内容
+- **语法解析**: YAML 语法解析在此发生，语法错误直接返回
+- **错误类型**: YAML 语法错误、文件不存在、权限不足
+
+#### 步骤 6：废弃键映射（Deprecation Remap）
+- **入口**: `internal/configuration/provider.go:36` → `koanfRemapKeys()`
+- **发生的事**: 
+  - 将旧版配置键自动映射到新版键（如 `host` → `server.host`）
+  - 处理多键合并（如 `host` + `port` → `address`）
+  - 收集废弃警告
+- **关键代码**: `internal/configuration/deprecation.go` 中的 `deprecations` 和 `deprecationsMKM`
+- **错误类型**: 废弃键使用警告、映射冲突错误
+
+#### 步骤 7：Unmarshal 到 Go 结构体（Decode Hooks 执行）
+- **入口**: `internal/configuration/provider.go:127-148` → `unmarshal()`
+- **发生的事**: 
+  - koanf 的 map 结构通过 mapstructure 反序列化到 `schema.Configuration` 结构体
+  - **Decode Hooks 按顺序执行**，完成类型转换：
+    ```
+    字符串 → mail.Address → url.URL → regexp.Regexp → Address → X.509证书 → 私钥 → 
+    TLS版本 → 密码摘要 → 语言标签 → IP网络 → UUID → time.Duration → RefreshIntervalDuration
+    ```
+- **语法校验**: 每个 Decode Hook 内部做格式校验，失败则 Push 错误
+- **错误类型**: 格式错误（如无效 URL、无效正则、无效证书）
+- **默认值**: 无，未配置的字段保持零值
+
+#### 步骤 8：Definition 引用解析
+- **入口**: `internal/configuration/provider.go:82-86` → `mapDefinitionsResult()`
+- **发生的事**: 将 `definitions` 部分定义的网络组别名解析为实际 IP 网络列表，供后续 ACL 使用
+- **错误类型**: 重复定义错误
+
+### 阶段三：验证与默认值填充（步骤 9-12）
+
+#### 步骤 9：未知配置键检查
+- **入口**: `internal/commands/context.go:240` → `ValidateKeys()`
+- **发生的事**: 检查所有加载的配置键是否在 `schema.Keys` 白名单中
+  - 未知键 → Push 错误
+  - 已废弃但未映射的键 → 提示替换建议
+- **关键代码**: `internal/configuration/validator/keys.go`
+- **错误类型**: 未知配置键错误
+
+#### 步骤 10：单字段语义校验 + 默认值兜底（Validator 第一遍）
+- **入口**: `internal/configuration/validator/configuration.go:17-76` → `ValidateConfiguration()`
+- **发生的事**: 按模块顺序调用各 Validate 函数，每个函数内部：
+  1. 检查字段是否为零值
+  2. 如为零值，从 `Default*Configuration` 结构体复制默认值
+  3. 如非零值，验证语义合法性（范围、格式、存在性等）
+- **执行顺序**:
+  ```
+  ValidateTheme → ValidateLog → ValidateDuo → ValidateTOTP → ValidateWebAuthn → 
+  ValidateIdentityValidation → ValidateAuthenticationBackend → ValidateDefinitions → 
+  ValidateAccessControl → ValidateRules → ValidateSession → ValidateRegulation → 
+  ValidateServer → ValidateTelemetry → ValidateStorage → ValidateNotifier → 
+  ValidateIdentityProviders → ValidateNTP → ValidatePasswordPolicy → ValidatePrivacyPolicy
+  ```
+- **默认值优先级**: `defaults.go` < `schema.Default*Configuration` < `validator 动态填充`
+- **错误类型**: 单字段语义错误（如端口超出范围、文件不存在）
+
+#### 步骤 11：交叉字段约束校验（Validator 第二遍）
+- **入口**: 同一 `ValidateConfiguration()` 内的特定函数
+- **发生的事**: 在单字段校验完成、默认值填充后，进行多字段一致性检查：
+  - `validateDefault2FAMethod`: 默认 2FA 方法必须在已启用方法中
+  - `ValidateServerTLS`: 证书和密钥必须同时配置
+  - `ValidateTLSConfig`: 最小版本 ≤ 最大版本
+  - `ValidateStorage`: 只能配置一种存储后端
+  - `validateServerEndpointsAuthzStrategies`: 授权策略名称不能重复
+- **关键特征**: 必须依赖步骤 10 填充的默认值才能正确校验
+- **错误类型**: 逻辑不一致错误
+
+#### 步骤 12：错误日志输出与终止判断
+- **入口**: `internal/commands/context.go:328-346` → `ConfigValidateLogRunE()`
+- **发生的事**: 
+  - 输出所有 warnings 到日志
+  - 如有 errors，输出并 Fatal 终止程序
+- **错误类型**: 前面积累的所有错误集中输出
+
+### 阶段四：运行时分发（步骤 13-14）
+
+#### 步骤 13：Providers 初始化
+- **入口**: `internal/commands/context.go:160` → `middlewares.NewProviders()`
+- **发生的事**: 使用验证后的 `*schema.Configuration` 初始化所有运行时组件：
+  - 存储 provider（MySQL/PostgreSQL/Local）
+  - 会话 provider（Redis/Memory）
+  - 认证 provider（LDAP/File）
+  - 通知 provider（SMTP/Filesystem）
+  - OIDC provider
+- **错误类型**: 连接错误、认证失败、模式版本不兼容
+
+#### 步骤 14：服务启动
+- **入口**: `internal/commands/root.go:103` → `service.RunAll()`
+- **发生的事**: 启动 HTTP 服务器、指标服务、文件监听器等
+- **配置使用**: 各服务直接从 `CmdCtx.config` 读取配置
+
+---
+
+## 默认值优先级总表
+
+| 优先级 | 层级 | 位置 | 覆盖范围 | 示例 |
+|-------|------|------|---------|------|
+| 1（最低） | 全局 defaults 映射 | `internal/configuration/defaults.go` | 特定键路径 | `"regulation.max_retries": 3` |
+| 2 | 结构体 Default 变量 | `internal/configuration/schema/*.go` | 整个模块 | `DefaultServerConfiguration` |
+| 3 | Validator 动态填充 | `internal/configuration/validator/*.go` | 单字段 | `if config.Server.Address == nil { config.Server.Address = ... }` |
+| 4 | YAML 配置文件 | 用户提供的 configuration.yml | 用户配置 | `server: address: tcp://:9091/` |
+| 5 | 环境变量 | `AUTHELIA_*` 环境变量 | 单个键 | `AUTHELIA_SERVER_ADDRESS=tcp://:9091/` |
+| 6（最高） | 密钥文件 | `AUTHELIA_*_FILE` 指向的文件 | 敏感字段 | `AUTHELIA_SESSION_SECRET_FILE=/run/secrets/session_secret` |
+
+---
+
+## 配置异常排查示例
+
+### 示例 1："configuration key not expected: server.unknown_field"
+
+**错误信息**:
+```
+Configuration: configuration key not expected: server.unknown_field
+```
+
+**排查路径**:
+1. **优先检查第 9 步（ValidateKeys）** - 这是未知键错误的唯一生成点
+2. 查看 `internal/configuration/schema/` 中是否定义了该字段
+3. 检查是否拼写错误，或该字段是废弃字段需要改用新键
+4. 参考 `internal/configuration/deprecation.go` 查看是否有键名变更
+
+**为什么不是其他层**:
+- 不是 Schema 层：Schema 层只定义结构，不检查未知键
+- 不是 Decode Hooks：类型转换只处理已知类型
+- 不是 Validator：Validator 只校验已解析的字段
+
+---
+
+### 示例 2："server: address 'tcp://invalid:port/' is invalid: port must be a number between 1 and 65535"
+
+**错误信息**:
+```
+Configuration: server: address 'tcp://invalid:port/' is invalid: port must be a number between 1 and 65535
+```
+
+**排查路径**:
+1. **优先检查第 7 步（Decode Hooks）还是第 10 步（Validator）**
+2. 看错误来源：`Address.ValidateHTTP()` → 这是在 `ValidateServerAddress` 中调用的 → **第 10 步**
+3. 检查配置文件中 `server.address` 的值
+4. 验证格式：`[scheme://][host]:port[/path]`
+5. 如果格式正确但端口是字符串 "port"，说明类型转换失败 → 回到 **第 7 步** 检查 `StringToAddressHookFunc`
+
+**为什么是 Validator 而非 Decode Hook**:
+- Decode Hook 阶段的 `StringToAddressHookFunc` 只做基本语法解析（`tcp://host:port` 格式正确就通过）
+- 端口范围检查是语义校验，在 Validator 层的 `ValidateServerAddress` → `Address.ValidateHTTP()` 中进行
+
+---
+
+### 示例 3："option 'default_2fa_method' must be one of the enabled options [totp] but it's configured as 'webauthn'"
+
+**错误信息**:
+```
+Configuration: option 'default_2fa_method' must be one of the enabled options [totp] but it's configured as 'webauthn'
+```
+
+**排查路径**:
+1. **直接定位第 11 步（交叉字段约束）** - 这是典型的多字段校验错误
+2. 查看 `validateDefault2FAMethod` 函数逻辑
+3. 检查配置中：
+   - `default_2fa_method: webauthn`
+   - `webauthn.disable: true` 或 `webauthn` 未配置
+4. 修复：要么启用 webauthn，要么将 default_2fa_method 改为 totp
+
+**为什么是第 11 步**:
+- 需要同时读取 `default_2fa_method`、`totp.disable`、`webauthn.disable`、`duo_api.disable` 四个字段
+- 必须在单字段校验和默认值填充完成后，才能确定哪些方法已启用
+- 这是典型的"业务规则校验"而非"语法格式校验"
+
+---
+
+### 示例 4：配置值不生效，始终使用默认值
+
+**现象**: 修改了配置文件中的某个值，但 Authelia 启动后仍使用默认值
+
+**排查路径（按优先级从高到低检查）**:
+1. **第 6 步 - 废弃键映射**: 检查该键是否已被废弃，是否需要使用新键名
+   - 查看 `internal/configuration/deprecation.go`
+2. **第 5 步 - 配置源优先级**: 
+   - 检查是否有环境变量覆盖了文件配置（优先级更高）
+   - 检查是否有密钥文件配置
+3. **第 4 步 - 配置文件路径**: 确认 Authelia 实际读取的是哪个配置文件
+   - 查看启动日志中的 "Loaded Configuration Sources"
+4. **第 10 步 - Validator 强制覆盖**: 某些 Validator 函数可能会强制覆盖用户配置
+   - 例如：Unix socket 地址会强制 `disable_healthcheck: true`
+
+---
+
+## 排查决策树
+
+```
+配置错误发生时：
+├─ 错误信息包含 "configuration key not expected" → 第 9 步 ValidateKeys
+├─ 错误信息包含 "could not parse" → 第 7 步 Decode Hooks
+├─ 错误信息包含 "must be one of" 且只涉及单个字段 → 第 10 步 单字段语义校验
+├─ 错误信息同时提到多个字段名 → 第 11 步 交叉字段约束
+├─ 配置值不生效 → 按优先级检查：环境变量 > 配置文件 > 默认值
+├─ YAML 语法错误 → 第 5 步 FileSource.Load
+└─ 启动后连接失败 → 第 13 步 Providers 初始化
+```
