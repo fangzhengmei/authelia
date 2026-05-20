@@ -317,29 +317,30 @@ if parsedURI, err = url.ParseRequestURI(targetURI); err != nil {
 }
 ```
 
-**被拒场景与真实处置**:
+**被拒场景与真实处置（最终核实）**:
 
 | 输入示例 | `url.ParseRequestURI` 结果 | 1FA 处理分支 | 2FA 处理分支 |
 |----------|---------------------------|-------------|-------------|
 | `secret.html` (相对路径) | ❌ 解析失败 | 认证失败，无回退 | 验证失败，无回退 |
 | `#https://bad` (无效格式) | ❌ 解析失败 | 认证失败，无回退 | 验证失败，无回退 |
+| `https//invalid-url` (缺少冒号) | ❌ 解析失败 | 认证失败，无回退 | 验证失败，无回退 |
+| `//evil.com/secret` (协议相对) | ❌ 解析失败（非标准请求 URI 格式） | 认证失败，无回退 | 验证失败，无回退 |
 | `/secret.html` (绝对路径) | ✅ 解析成功 (scheme="", path="/secret.html") | 安全检查失败 → 进入回退逻辑 | 安全检查失败 → 直接返回 OK |
-| `//evil.com/secret` (协议相对) | ✅ 解析成功 (scheme="", host="evil.com", path="/secret") | 安全检查失败 → 进入回退逻辑 | 安全检查失败 → 直接返回 OK |
 | `http://secure.example.com` | ✅ 解析成功 (scheme="http") | 安全检查失败 → 进入回退逻辑 | 安全检查失败 → 直接返回 OK |
 | `https://evil.com` (外部域名) | ✅ 解析成功 (scheme="https") | 安全检查失败 → 进入回退逻辑 | 安全检查失败 → 直接返回 OK |
 
-**关键差异 (核心修正)**:
+**关键差异 (最终修正)**:
 
 1. **绝对路径 `/secret.html` 会解析成功**：
    - `url.ParseRequestURI` 接受以 `/` 开头的绝对路径作为合法的请求 URI
    - 解析后 scheme 为空字符串，`IsURISecure` 检查失败
    - 在 1FA 中进入回退逻辑，**不会直接报认证失败**
 
-2. **双斜杠地址 `//evil.com/secret` 也会解析成功**：
-   - Go 的 `url.ParseRequestURI` 将 `//` 开头的 URL 解析为协议相对 URL
-   - 解析结果：scheme="", host="evil.com", path="/secret"
-   - `IsURISecure` 检查失败（scheme 为空），进入安全检查与回退逻辑
-   - **不会直接报认证失败**
+2. **双斜杠地址 `//evil.com/secret` 会解析失败**（关键修正）：
+   - Go 的 `url.ParseRequestURI` 要求输入是标准的请求 URI：要么是绝对路径（`/path`），要么是完整 URL（`https://...`）
+   - `//evil.com/secret` 既不是有效的绝对路径（第二个 `/` 使其不符合 RFC 3986 的 path-absolute 规则），也不是完整 URL（缺少 scheme）
+   - 解析失败，**直接返回认证失败，不进入安全校验与回退**
+   - 错误：`invalid URI for request`
 
 3. **1FA 与 2FA 的回退逻辑不同**：
    - **1FA 流程**：解析成功但不安全 → 尝试回退到默认 URL（如果不需要 2FA 且有默认 URL）
@@ -347,7 +348,7 @@ if parsedURI, err = url.ParseRequestURI(targetURI); err != nil {
 
 4. **解析失败才会直接报错**：
    - 只有当 `url.ParseRequestURI` 返回错误时，才会直接返回认证/验证失败
-   - 这类场景包括：相对路径 `secret.html`、无效格式 `#https://bad`、`https//invalid-url`（缺少冒号）等
+   - 这类场景包括：相对路径 `secret.html`、无效格式 `#https://bad`、`https//invalid-url`（缺少冒号）、协议相对 URL `//evil.com/secret` 等
 
 **测试验证** (`internal/handlers/handler_firstfactor_password_test.go:582-617`):
 ```go
@@ -360,6 +361,11 @@ s.mock.Assert200KO(s.T(), "Authentication failed. Check your credentials.")
 // URI: "https//invalid-url" → 解析失败（缺少冒号）→ 返回操作失败
 mock.Assert200KO(t, "Operation failed.")
 ```
+
+**Go 标准库行为依据**：
+- `url.ParseRequestURI` 严格遵循 RFC 3986 的请求 URI 格式
+- 双斜杠开头的 `//authority/path` 格式在完整 URL 解析（`url.Parse`）中可能被接受，但在 `ParseRequestURI` 中被拒绝
+- `ParseRequestURI` 是专门为 HTTP 请求行设计的，不接受协议相对 URL
 
 **错误消息**:
 - 1FA 解析失败: `"Authentication failed. Check your credentials."`
@@ -413,9 +419,9 @@ targetURI 输入
     └─► targetURI 非空
           │
           ├─► url.ParseRequestURI() 失败? ──是──► 返回认证失败（无回退）
-          │                                     （如: secret.html、#https://bad）
+          │                                     （如: secret.html、#https://bad、//evil.com/、https//invalid-url）
           │
-          └─► 解析成功（如: /secret.html、//evil.com/、http://...、https://...）
+          └─► 解析成功（如: /secret.html、http://...、https://...）
                 │
                 ├─► 1FA 场景
                 │     │
@@ -518,15 +524,15 @@ var redirectionAuthorizations = map[string]bool{
 6. **可信上下文**: 回退决策基于 X-Forwarded 头（代理设置），而非用户可控的 targetURL
 7. **前置防护**: 配置阶段就检测 cookie 域重叠，避免运行时优先级混乱
 
-### 7.2 关键安全边界（最终修正）
+### 7.2 关键安全边界（最终核实）
 
 | 场景 | 1FA 处置方式 | 1FA 是否回退 | 2FA 处置方式 | 2FA 是否回退 |
 |------|-------------|-------------|-------------|-------------|
 | 相对路径 `secret.html` | 解析失败 → 认证失败 | ❌ 无回退 | 解析失败 → 验证失败 | ❌ 无回退 |
 | 无效格式 `#https://bad` | 解析失败 → 认证失败 | ❌ 无回退 | 解析失败 → 验证失败 | ❌ 无回退 |
 | 无效 URL `https//invalid-url` | 解析失败 → 认证失败 | ❌ 无回退 | 解析失败 → 验证失败 | ❌ 无回退 |
+| 协议相对 `//evil.com/secret` | 解析失败 → 认证失败 | ❌ 无回退 | 解析失败 → 验证失败 | ❌ 无回退 |
 | 绝对路径 `/secret.html` | 解析成功 → 安全检查失败 → 回退 | ✅ 有回退 | 解析成功 → 安全检查失败 → 返回 OK | ❌ 无回退 |
-| 协议相对 `//evil.com/secret` | 解析成功 → 安全检查失败 → 回退 | ✅ 有回退 | 解析成功 → 安全检查失败 → 返回 OK | ❌ 无回退 |
 | HTTP 协议 `http://internal.com` | 解析成功 → 安全检查失败 → 回退 | ✅ 有回退 | 解析成功 → 安全检查失败 → 返回 OK | ❌ 无回退 |
 | 外部域名 `https://evil.com` | 解析成功 → 安全检查失败 → 回退 | ✅ 有回退 | 解析成功 → 安全检查失败 → 返回 OK | ❌ 无回退 |
 | 2FA 认证中（1FA 后） | 等待 2FA 完成 → 返回 OK | ❌ 不重定向 | - | - |
@@ -554,11 +560,11 @@ var redirectionAuthorizations = map[string]bool{
    - `/secret.html` 这种绝对路径会被 `url.ParseRequestURI` 成功解析
    - 解析后 scheme 为空，安全检查失败，在 1FA 中会进入回退逻辑
 
-6. **协议相对 URL 的特殊处理**:
-   - `//evil.com/secret` 这种双斜杠地址会被 `url.ParseRequestURI` 成功解析
-   - 解析结果：scheme 为空，host 为 `evil.com`，path 为 `/secret`
-   - 安全检查失败后进入回退逻辑，**不会直接报认证失败**
-   - 这是因为 `url.ParseRequestURI` 将 `//` 开头的 URL 视为合法的协议相对 URL
+6. **协议相对 URL 的特殊处理（最终核实）**:
+   - `//evil.com/secret` 这种双斜杠地址会被 `url.ParseRequestURI` **解析失败**
+   - 原因：`ParseRequestURI` 严格遵循 RFC 3986，只接受绝对路径（`/path`）或完整 URL（`scheme://host/path`）
+   - 双斜杠开头的格式既不符合 path-absolute 规则（第二个 `/` 非法），也不是完整 URL（缺少 scheme）
+   - **直接返回认证失败，不进入安全校验与回退**
 
 7. **2FA 场景**:
    - 1FA 成功后若需要 2FA，不会自动重定向
