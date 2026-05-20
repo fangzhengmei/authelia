@@ -104,11 +104,120 @@ func (ctx *AutheliaCtx) GetCookieDomainFromTargetURI(targetURI *url.URL) string 
 }
 ```
 
+**命中优先级**:
+- 按 `Session.Cookies` 配置的**顺序遍历**，返回第一个匹配的域
+- 配置顺序决定了优先级，先配置的域优先匹配
+- 多域场景下，每个域可以有独立的默认重定向 URL
+
+**配置示例** (`internal/suites/MultiCookieDomain/configuration.yml:66-77`):
+```yaml
+session:
+  cookies:
+    - name: 'authelia_session'
+      domain: 'example.com'
+      authelia_url: 'https://login.example.com:8080'
+    - name: 'example2_session'
+      domain: 'example2.com'
+      authelia_url: 'https://login.example2.com:8080'
+    - name: 'authelia_session'
+      domain: 'example3.com'
+      authelia_url: 'https://login.example3.com:8080'
+```
+
+### 2.4 多 Cookie 域重叠防护
+
+**位置**: `internal/configuration/validator/session.go:154-164`
+
+```go
+func validateSessionUniqueCookieDomain(i int, config *schema.Session, domains []string, validator *schema.StructValidator) {
+    var d = config.Cookies[i]
+    if utils.IsStringInSliceF(d.Domain, domains, utils.HasDomainSuffix) {
+        if utils.IsStringInSlice(d.Domain, domains) {
+            validator.Push(fmt.Errorf(errFmtSessionDomainDuplicate, sessionDomainDescriptor(i, d)))
+        } else {
+            validator.Push(fmt.Errorf(errFmtSessionDomainDuplicateCookieScope, sessionDomainDescriptor(i, d)))
+        }
+    }
+}
+```
+
+**重叠检测逻辑**:
+1. 使用 `HasDomainSuffix` 作为比较函数，检测新域是否与已配置域有包含关系
+2. 精确重复 → 报错："domain is a duplicate value"
+3. 作用域重叠（如 `example.com` 和 `sub.example.com`）→ 报错："shares the same cookie domain scope"
+4. **关键**: 此验证在配置加载阶段执行，运行时不会出现域重叠情况
+
 ---
 
-## 三、登录后重定向决策流程
+## 三、会话域选择对回退决策的影响
 
-### 3.1 1FA 登录响应处理 (`Handle1FAResponse`)
+### 3.1 会话域与默认重定向 URL 的绑定关系
+
+**核心机制**: 每个 Session Cookie 域配置可以有独立的 `DefaultRedirectionURL`，当目标 URL 不安全时，回退使用的默认 URL 由**当前请求的会话域**决定，而非目标 URL 的域。
+
+**会话域确定流程**:
+```
+当前请求
+    │
+    ▼
+GetXOriginalURLOrXForwardedURL()  ── 解析请求的原始 URL
+    │
+    ▼
+GetCookieDomainFromTargetURI()    ── 匹配 Cookie 域（按配置顺序）
+    │
+    ▼
+GetSessionProvider()              ── 获取该域的会话提供程序
+    │
+    ▼
+provider.Config.DefaultRedirectionURL  ── 该域对应的默认重定向 URL
+```
+
+**关键代码** (`internal/middlewares/authelia_context.go:330-345`):
+```go
+func (ctx *AutheliaCtx) GetSessionProvider() (provider *session.Session, err error) {
+    if ctx.session == nil {
+        var targetURI *url.URL
+        if targetURI, err = ctx.GetXOriginalURLOrXForwardedURL(); err != nil {
+            return nil, fmt.Errorf("unable to retrieve session cookie domain: %w", err)
+        }
+        if ctx.session, err = ctx.GetSessionProviderByTargetURI(targetURI); err != nil {
+            return nil, err
+        }
+    }
+    return ctx.session, nil
+}
+```
+
+**测试验证** (`internal/middlewares/authelia_context_blackbox_test.go:1239-1257`):
+```go
+// X-Original-URL: https://auth.example.com/consent
+// → 匹配 example.com 域
+// → 返回该域的 DefaultRedirectionURL: https://www.example.com
+assert.Equal(t, &url.URL{Scheme: "https", Host: "www.example.com"}, 
+             mock.Ctx.GetDefaultRedirectionURL())
+
+// X-Original-URL: https://auth.example2.com/consent  
+// → 匹配 example2.com 域
+// → 返回该域的 DefaultRedirectionURL: https://www.example2.com
+assert.Equal(t, &url.URL{Scheme: "https", Host: "www.example2.com"}, 
+             mock2.Ctx.GetDefaultRedirectionURL())
+```
+
+### 3.2 回退决策的域上下文依赖
+
+**场景**: 用户访问 `https://app.example.com/secret` 被重定向到登录页，登录后 targetURL 为外部恶意地址 `https://evil.com`
+
+**决策链**:
+1. `IsSafeRedirectionTargetURI(https://evil.com)` → `false`（域名不匹配）
+2. 触发回退逻辑：`GetDefaultRedirectionURL()`
+3. `GetDefaultRedirectionURL()` 使用**当前请求的会话域**（从 X-Original-URL 或 X-Forwarded-* 头获取），而非 targetURL 的域
+4. 如果当前会话域是 `example.com`，则回退到 `example.com` 配置的默认 URL
+
+**安全意义**:
+- 防止攻击者通过构造恶意 targetURL 影响回退目标
+- 回退决策始终基于可信的请求上下文（代理设置的 X-Forwarded 头），而非用户可控的 targetURL
+
+### 3.3 1FA 登录响应处理 (`Handle1FAResponse`)
 
 **位置**: `internal/handlers/response.go:26-91`
 
@@ -136,7 +245,7 @@ IsSafeRedirectionTargetURI? ──否──► 尝试默认重定向 URL
                                 返回 OK（不重定向）
 ```
 
-### 3.2 2FA 登录响应处理 (`Handle2FAResponse`)
+### 3.4 2FA 登录响应处理 (`Handle2FAResponse`)
 
 **位置**: `internal/handlers/response.go:93-136`
 
@@ -157,7 +266,7 @@ IsSafeRedirectionTargetURI? ──是──► 重定向到 targetURI  返回 OK
 返回 OK（不重定向）
 ```
 
-### 3.3 关键代码片段（外链回退处置）
+### 3.5 关键代码片段（外链回退处置）
 
 **位置**: `internal/handlers/response.go:68-84`
 
@@ -184,6 +293,47 @@ if !ctx.IsSafeRedirectionTargetURI(targetURL) {
 2. 降级条件：未启用 2FA **且** 配置了默认重定向 URL
 3. 降级策略：重定向到配置的默认 URL
 4. 无默认 URL 时：返回 `{"status": "OK"}`，由前端决定跳转
+
+### 3.6 相对地址或缺失协议的处理分支
+
+**核心机制**: Authelia 使用 `url.ParseRequestURI` 解析 targetURL，该函数要求 URL 必须是**绝对 URI**（包含 scheme）。
+
+**1FA 场景处理** (`internal/handlers/response.go:43-49`):
+```go
+var targetURL *url.URL
+if targetURL, err = url.ParseRequestURI(targetURI); err != nil {
+    ctx.Error(fmt.Errorf("unable to parse target URL %s: %w", targetURI, err), 
+              messageAuthenticationFailed)
+    return
+}
+```
+
+**2FA 场景处理** (`internal/handlers/response.go:113-121`):
+```go
+if parsedURI, err = url.ParseRequestURI(targetURI); err != nil {
+    ctx.Error(fmt.Errorf("unable to determine if URI '%s' is safe to redirect to: failed to parse URI '%s': %w", 
+              targetURI, targetURI, err), messageMFAValidationFailed)
+    return
+}
+```
+
+**被拒场景与处置**:
+
+| 输入示例 | `url.ParseRequestURI` 结果 | 处理分支 |
+|----------|---------------------------|----------|
+| `/secret.html` | 错误：`invalid URI for request` | 返回认证失败，无回退 |
+| `//evil.com/secret` | 错误：`invalid URI for request` | 返回认证失败，无回退 |
+| `secret.html` | 错误：`invalid URI for request` | 返回认证失败，无回退 |
+| `http://secure.example.com` | 解析成功 → `IsURISecure` → false | 进入外链回退逻辑 |
+| `https://evil.com` | 解析成功 → 域名不匹配 → false | 进入外链回退逻辑 |
+
+**关键差异**:
+- **解析失败**（相对地址/缺失协议）→ 直接报错返回，**不触发**外链回退
+- **解析成功但不安全**（协议错误/外部域名）→ 触发外链回退逻辑
+
+**错误消息**:
+- 1FA: `"Authentication failed. Check your credentials."`
+- 2FA: `"Authentication failed, please retry later."`
 
 ---
 
@@ -219,7 +369,36 @@ func (ctx *AutheliaCtx) GetDefaultRedirectionURL() *url.URL {
 
 ## 五、安全检查的调用链
 
-### 5.1 登录成功后的完整调用链
+### 5.1 完整的重定向决策树
+
+```
+targetURI 输入
+    │
+    ├─► targetURI 为空? ──是──► 使用当前域的 DefaultRedirectionURL
+    │                          │
+    │                          ├─► 存在且无需 2FA? ──是──► 重定向到默认 URL
+    │                          └─► 否则 ──► 返回 OK
+    │
+    └─► targetURI 非空
+          │
+          ├─► url.ParseRequestURI() 失败? ──是──► 返回认证失败（无回退）
+          │                                     （相对地址、缺失协议走此分支）
+          │
+          └─► 解析成功
+                │
+                ├─► 1FA 场景: 需要 2FA? ──是──► 返回 OK（等待 2FA）
+                │
+                └─► IsSafeRedirectionTargetURI()
+                      │
+                      ├─► 安全? ──是──► 重定向到 targetURI
+                      │
+                      └─► 不安全 ──► 外链回退逻辑
+                                  │
+                                  ├─► 无需 2FA 且有默认 URL? ──是──► 重定向到当前域的默认 URL
+                                  └─► 否则 ──► 返回 OK
+```
+
+### 5.2 登录成功后的完整调用链
 
 ```
 FirstFactorPasswordPOST
@@ -227,19 +406,20 @@ FirstFactorPasswordPOST
     └── Handle1FAResponse(targetURI, ...)
           │
           ├── url.ParseRequestURI(targetURI)
+          │     └── 失败直接返回认证失败（相对地址等）
           │
           ├── IsSafeRedirectionTargetURI(targetURL)
           │     ├── IsURISecure(targetURI)
           │     │     └── 检查 scheme ∈ {https, wss}
           │     │
           │     └── GetCookieDomainFromTargetURI(targetURI)
-          │           └── HasDomainSuffix(hostname, cookieDomain)
-          │                 └── 域名后缀匹配
+          │           └── 按配置顺序遍历 Cookies，返回第一个匹配的域
           │
           └── 安全检查失败时: GetDefaultRedirectionURL()
+                └── 使用当前请求的会话域（从 X-Forwarded 头获取）
 ```
 
-### 5.2 登出时的安全检查
+### 5.3 登出时的安全检查
 
 **位置**: `internal/handlers/handler_logout.go:33-36`
 
@@ -252,7 +432,7 @@ if err == nil {
 
 登出时同样执行安全检查，但仅返回安全标志，由前端决定是否跳转。
 
-### 5.3 API 级别的安全检查
+### 5.4 API 级别的安全检查
 
 **位置**: `internal/handlers/handler_checks_safe_redirection.go:42`
 
@@ -293,13 +473,34 @@ var redirectionAuthorizations = map[string]bool{
 2. **优雅降级**: 外链不直接报错，而是回退到默认 URL 或让前端处理
 3. **一致复用**: `IsSafeRedirectionTargetURI` 在登录、登出、API 检查中复用
 4. **配置强校验**: 默认重定向 URL 在启动时就验证安全性
+5. **域隔离**: 多 cookie 域场景下，每个域的默认重定向 URL 独立配置，互不影响
+6. **可信上下文**: 回退决策基于 X-Forwarded 头（代理设置），而非用户可控的 targetURL
+7. **前置防护**: 配置阶段就检测 cookie 域重叠，避免运行时优先级混乱
 
-### 7.2 注意事项
+### 7.2 关键安全边界
 
-1. 域名匹配是**后缀匹配**，需注意 `example.com` 会匹配 `example.com.attacker.com` 吗？
-   - 不会，因为 `HasDomainSuffix` 检查的是 `.example.com` 后缀
-   - 正确的安全边界：`auth.example.com` ✓，`xexample.com` ✗
+| 场景 | 处置方式 | 是否回退 |
+|------|----------|----------|
+| 相对地址 `/secret.html` | 解析失败 → 认证失败 | ❌ 无回退 |
+| 缺失协议 `//evil.com` | 解析失败 → 认证失败 | ❌ 无回退 |
+| HTTP 协议 `http://internal.com` | 协议不安全 → 回退 | ✅ 有回退 |
+| 外部域名 `https://evil.com` | 域名不匹配 → 回退 | ✅ 有回退 |
+| 2FA 认证中 | 等待 2FA 完成 | ❌ 不重定向 |
 
-2. 默认重定向 URL 也受安全规则约束，不能配置为外部 URL
+### 7.3 注意事项
 
-3. 2FA 场景下不会自动重定向，必须等 2FA 完成后才执行跳转决策
+1. **域名匹配是后缀匹配**:
+   - `example.com` 不会匹配 `example.com.attacker.com`
+   - 正确边界：`auth.example.com` ✓，`xexample.com` ✗
+
+2. **多域优先级**:
+   - 按 `Session.Cookies` 配置顺序匹配，先配置的域优先
+   - 配置阶段已防止域重叠，运行时无歧义
+
+3. **回退目标的安全性**:
+   - 默认重定向 URL 也受安全规则约束，必须是 https 且在 cookie 域内
+   - 回退目标由当前请求的会话域决定，与 targetURL 无关
+
+4. **2FA 场景**:
+   - 1FA 成功后若需要 2FA，不会自动重定向
+   - 必须等 2FA 完成后才执行最终跳转决策
