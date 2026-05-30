@@ -115,6 +115,82 @@ func NewProvider(config schema.Session, certPool *x509.CertPool) *Provider {
 - 多个域名可以共享同一个存储后端（Redis）
 - 每个域名有独立的cookie配置（名称、过期时间等）
 
+### 1.4 多cookie域重叠时的配置顺序命中行为
+
+**匹配算法**：`GetCookieDomainFromTargetURI()` [internal/middlewares/authelia_context.go:251-265]
+
+```go
+func (ctx *AutheliaCtx) GetCookieDomainFromTargetURI(targetURI *url.URL) string {
+    hostname := targetURI.Hostname()
+    
+    // 遍历配置的所有cookie域名，按配置顺序匹配
+    for _, domain := range ctx.Configuration.Session.Cookies {
+        if utils.HasDomainSuffix(hostname, domain.Domain) {
+            return domain.Domain
+        }
+    }
+    return ""
+}
+```
+
+**核心机制**：**按配置顺序遍历，返回第一个匹配的域名**
+
+**域名后缀匹配算法**：`HasDomainSuffix()` [internal/utils/url.go:57-71]
+
+```go
+func HasDomainSuffix(domain, domainSuffix string) bool {
+    if domainSuffix == "" {
+        return false
+    }
+    // 精确匹配
+    if domain == domainSuffix {
+        return true
+    }
+    // 后缀匹配：支持 .example.com 或 example.com 匹配子域名
+    if (strings.HasPrefix(domainSuffix, ".") && strings.HasSuffix(domain, domainSuffix)) || 
+       strings.HasSuffix(domain, "."+domainSuffix) {
+        return true
+    }
+    return false
+}
+```
+
+**重叠场景分析**：
+
+假设配置顺序为：
+```yaml
+session:
+  cookies:
+    - domain: "example.com"
+    - domain: "sub.example.com"
+```
+
+当请求 `app.sub.example.com` 时：
+1. 首先匹配 `example.com` → `HasDomainSuffix("app.sub.example.com", "example.com")` → 返回 `true`
+2. 直接返回 `example.com`，不会继续匹配 `sub.example.com`
+
+**正确的配置顺序**（子域名在前）：
+```yaml
+session:
+  cookies:
+    - domain: "sub.example.com"  # 更具体的域名优先
+    - domain: "example.com"      # 通用域名在后
+```
+
+**安全影响**：
+
+| 配置顺序问题 | 安全风险 | 影响范围 |
+|------------|---------|---------|
+| 父域名配置在子域名之前 | 子域名请求被错误路由到父域名的会话配置 | 会话隔离失效，可能导致权限泄露 |
+| 子域名使用不同的过期策略 | 子域名继承父域名的过期时间，违背安全预期 | 会话有效期不符合设计 |
+| 子域名禁用Remember Me但父域名启用 | 子域名用户仍可使用Remember Me功能 | 会话持久化风险 |
+| 不同域名使用相同cookie名称 | 浏览器cookie覆盖，导致会话混乱 | 用户体验问题，会话状态异常 |
+
+**配置最佳实践**：
+1. 子域名配置在前，父域名配置在后
+2. 不同域名使用不同的cookie名称
+3. 明确每个域名的安全策略，避免隐式继承
+
 ---
 
 ## 2. 不同存储后端的抽象及其差异
@@ -249,7 +325,145 @@ func (e *EncryptingSerializer) Decode(dst *session.Dict, src []byte) (err error)
 }
 ```
 
-### 2.5 存储后端对比
+### 2.5 会话数据存储的实际形态
+
+**重要修正**：会话数据在store中的存储经历两次序列化，且存在类型不一致的问题。
+
+#### 2.5.1 Authelia 层面的存储流程
+
+**写入流程**：`SaveSession()` [internal/session/session.go:57-78]
+
+```go
+func (p *Session) SaveSession(ctx *fasthttp.RequestCtx, userSession UserSession) (err error) {
+    var (
+        store           *session.Store
+        userSessionJSON []byte
+    )
+
+    if store, err = p.sessionHolder.Get(ctx); err != nil {
+        return err
+    }
+
+    // 第一次序列化：UserSession -> JSON []byte
+    if userSessionJSON, err = json.Marshal(userSession); err != nil {
+        return err
+    }
+
+    // 存储到Dict中，Key为"UserSession"，Value为JSON []byte
+    store.Set(userSessionStorerKey, userSessionJSON)
+
+    if err = p.sessionHolder.Save(ctx, store); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+
+**读取流程**：`GetSession()` [internal/session/session.go:30-54]
+
+```go
+func (p *Session) GetSession(ctx *fasthttp.RequestCtx) (userSession UserSession, err error) {
+    var store *session.Store
+
+    if store, err = p.sessionHolder.Get(ctx); err != nil {
+        return p.NewDefaultUserSession(), err
+    }
+
+    // 尝试读取 []byte 类型
+    userSessionJSON, ok := store.Get(userSessionStorerKey).([]byte)
+
+    if !ok {
+        // 会话不存在时，创建新会话
+        userSession = p.NewDefaultUserSession()
+
+        // ⚠️ 注意：这里存储的是 UserSession 对象，不是 []byte
+        store.Set(userSessionStorerKey, userSession)
+
+        return userSession, nil
+    }
+
+    // JSON反序列化
+    if err = json.Unmarshal(userSessionJSON, &userSession); err != nil {
+        return p.NewDefaultUserSession(), err
+    }
+
+    return userSession, nil
+}
+```
+
+**潜在问题**：
+- 新创建的会话存储的是 `UserSession` 对象（结构体）
+- 但 `SaveSession()` 存储的是 `[]byte`（JSON序列化结果）
+- 下次 `GetSession()` 时，类型断言 `.([]byte)` 才会成功
+- 如果只调用 `GetSession()` 而不调用 `SaveSession()`，下次会因类型不匹配重新创建会话
+
+#### 2.5.2 fasthttp/session 层面的序列化
+
+当配置了序列化器（Redis模式）时，`EncodeFunc` 和 `DecodeFunc` 会被调用：
+
+**完整存储链路（Redis模式）**：
+
+```
+UserSession 对象
+    ↓ json.Marshal [internal/session/session.go:67]
+JSON []byte
+    ↓ store.Set("UserSession", jsonBytes) [session.go:71]
+Dict{KV: map["UserSession"]: jsonBytes}
+    ↓ EncryptingSerializer.Encode [encrypting_serializer.go:30]
+    ├─ Dict -> Msgpack 序列化
+    └─ Msgpack -> AES-GCM 加密
+AES-GCM(Msgpack(Dict))
+    ↓ provider.Save()
+Redis存储 (key: "authelia-session<session-id>")
+```
+
+**完整读取链路（Redis模式）**：
+
+```
+Redis存储
+    ↓ provider.Get()
+AES-GCM(Msgpack(Dict))
+    ↓ EncryptingSerializer.Decode [encrypting_serializer.go:48]
+    ├─ AES-GCM 解密
+    └─ Msgpack 反序列化
+Dict{KV: map["UserSession"]: jsonBytes}
+    ↓ store.Get("UserSession").([]byte) [session.go:37]
+JSON []byte
+    ↓ json.Unmarshal [session.go:49]
+UserSession 对象
+```
+
+#### 2.5.3 内存模式 vs Redis 模式对比
+
+| 层级 | Memory模式 | Redis模式 |
+|------|-----------|----------|
+| Authelia层面 | UserSession → JSON → Dict | UserSession → JSON → Dict |
+| 序列化器 | 无（Dict直接存储在内存） | Dict → Msgpack → AES-GCM |
+| 存储介质 | sync.Map（内存） | Redis |
+| 数据加密 | ❌ | ✅ AES-GCM-256 |
+| 持久化 | ❌ | ✅ |
+
+#### 2.5.4 修正后的会话数据存储结构
+
+```
+Authelia Store (Dict)
+  └─ Key: "UserSession"
+     └─ Value: JSON([]byte) 序列化的 UserSession 对象
+           ├─ CookieDomain: "example.com"
+           ├─ Username: "john"
+           ├─ ... 其他字段
+           └─ 注意：新会话首次存储时是 UserSession 对象，SaveSession 后变为 []byte
+```
+
+**Redis存储时**：
+- Key: `authelia-session<session-id>`
+- Value: AES-GCM(Msgpack(Dict{
+    "UserSession": JSON(UserSession)
+  }))
+- 过期时间：会话 Expiration 配置
+
+### 2.6 存储后端对比
 
 | 特性 | Memory | Redis | Redis Sentinel |
 |------|--------|-------|---------------|
@@ -283,26 +497,6 @@ func (ctx *AutheliaCtx) GetCookieDomainFromTargetURI(targetURI *url.URL) string 
 }
 ```
 
-**域名后缀匹配算法**：`HasDomainSuffix()` [internal/utils/url.go:57-71]
-
-```go
-func HasDomainSuffix(domain, domainSuffix string) bool {
-    if domainSuffix == "" {
-        return false
-    }
-    // 精确匹配
-    if domain == domainSuffix {
-        return true
-    }
-    // 后缀匹配：支持 .example.com 或 example.com 匹配子域名
-    if (strings.HasPrefix(domainSuffix, ".") && strings.HasSuffix(domain, domainSuffix)) || 
-       strings.HasSuffix(domain, "."+domainSuffix) {
-        return true
-    }
-    return false
-}
-```
-
 **匹配示例**：
 - `example.com` 匹配 `example.com`、`app.example.com`、`sub.app.example.com`
 - `.example.com` 匹配 `app.example.com`、`sub.app.example.com`，但不匹配 `example.com`
@@ -313,8 +507,17 @@ func HasDomainSuffix(domain, domainSuffix string) bool {
 
 ```go
 func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error) {
-    // ... 获取会话 ...
-    
+    var provider *session.Session
+
+    if provider, err = ctx.GetSessionProvider(); err != nil {
+        return userSession, err
+    }
+
+    if userSession, err = provider.GetSession(ctx.RequestCtx); err != nil {
+        ctx.Logger.Error("Unable to retrieve user session")
+        return provider.NewDefaultUserSession(), nil
+    }
+
     // 验证会话中存储的CookieDomain与当前请求域名是否匹配
     if userSession.CookieDomain != provider.Config.Domain {
         ctx.Logger.Warnf("Destroying session cookie as the cookie domain '%s' does not match "+
@@ -323,9 +526,15 @@ func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error
             userSession.CookieDomain, provider.Config.Domain)
         
         // 销毁可疑会话并创建新会话
-        provider.DestroySession(ctx.RequestCtx)
+        if err = provider.DestroySession(ctx.RequestCtx); err != nil {
+            ctx.Logger.WithError(err).Error("Error occurred trying to destroy the session cookie")
+        }
+
         userSession = provider.NewDefaultUserSession()
-        provider.SaveSession(ctx.RequestCtx, userSession)
+
+        if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
+            ctx.Logger.WithError(err).Error("Error occurred trying to save the new session cookie")
+        }
     }
     return
 }
@@ -335,12 +544,34 @@ func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error
 
 ```go
 func (s *CookieSessionAuthnStrategy) Get(ctx AuthzContext, manager session.Manager, _ *authorization.Object) (authn *Authn, err error) {
-    // ... 获取会话 ...
-    
+    var userSession session.UserSession
+
+    authn = &Authn{
+        Type:     AuthnTypeCookie,
+        Level:    authentication.NotAuthenticated,
+        Username: anonymous,
+    }
+
+    if userSession, err = manager.GetSession(); err != nil {
+        return authn, fmt.Errorf("failed to retrieve user session: %w", err)
+    }
+
     // 同样的域绑定验证
     if userSession.CookieDomain != manager.GetSessionConfig().Domain {
-        manager.DestroySession()
-        // ... 创建新会话 ...
+        ctx.GetLogger().Warnf("Destroying session cookie as the cookie domain '%s' does not match "+
+            "the requests detected cookie domain '%s' which may be a sign a user tried to move "+
+            "this cookie from one domain to another", 
+            userSession.CookieDomain, manager.GetSessionConfig().Domain)
+
+        if err = manager.DestroySession(); err != nil {
+            ctx.GetLogger().WithError(err).Error("Error occurred trying to destroy the session cookie")
+        }
+
+        userSession = manager.NewDefaultUserSession()
+
+        if err = manager.SaveSession(userSession); err != nil {
+            ctx.GetLogger().WithError(err).Error("Error occurred trying to save the new session cookie")
+        }
     }
     // ...
 }
@@ -434,29 +665,62 @@ if !userSession.KeepMeLoggedIn {
 }
 ```
 
-#### 4.2.2 用户被删除/禁用
+#### 4.2.2 用户资料刷新的失效策略
 
 **检查函数**：`handleSessionValidateRefresh()` [internal/handlers/handler_authz_authn.go:498-555]
 
 ```go
 func handleSessionValidateRefresh(ctx AuthzContext, userSession *session.UserSession, refresh schema.RefreshIntervalDuration) (modified, invalid bool) {
-    // ... 检查是否需要刷新 ...
-    
-    // 从认证后端获取最新用户信息
-    details, err := ctx.GetProviders().UserProvider.GetDetails(userSession.Username)
-    if err != nil {
-        if errors.Is(err, authentication.ErrUserNotFound) {
-            // 用户不存在，标记会话无效
-            return false, true
-        }
+    if refresh.Never() || userSession.IsAnonymous() {
         return false, false
     }
-    
-    // 更新用户信息（邮箱、组、显示名）
-    userSession.Emails, userSession.Groups, userSession.DisplayName = details.Emails, details.Groups, details.DisplayName
-    return true, false
+
+    ctx.GetLogger().WithField("username", userSession.Username).Trace("Checking if we need check the authentication backend for an updated profile for user")
+
+    if !refresh.Always() && userSession.RefreshTTL.After(ctx.GetClock().Now()) {
+        return false, false
+    }
+
+    ctx.GetLogger().WithField("username", userSession.Username).Debug("Checking the authentication backend for an updated profile for user")
+
+    var (
+        details *authentication.UserDetails
+        err     error
+    )
+    if details, err = ctx.GetProviders().UserProvider.GetDetails(userSession.Username); err != nil {
+        // 错误处理分支
+        if errors.Is(err, authentication.ErrUserNotFound) {
+            // 情况1：用户明确不存在（被删除/禁用）
+            ctx.GetLogger().WithField("username", userSession.Username).Error(
+                "Error occurred while attempting to update user details for user: " +
+                "the user was not found indicating they were deleted, disabled, " +
+                "or otherwise no longer authorized to login")
+
+            return false, true  // 标记会话无效
+        }
+
+        // 情况2：后端临时异常（网络问题、LDAP连接失败等）
+        ctx.GetLogger().WithError(err).WithField("username", userSession.Username).Error(
+            "Error occurred while attempting to update user details for user")
+
+        return false, false  // 不标记无效，继续使用现有会话
+    }
+
+    // ... 用户信息更新逻辑 ...
 }
 ```
+
+**两种错误情况的策略对比**：
+
+| 错误类型 | 判定条件 | 失效策略 | 设计考量 |
+|---------|---------|---------|---------|
+| 用户不存在 | `errors.Is(err, authentication.ErrUserNotFound)` | ✅ 立即失效（invalid=true） | 用户被明确删除/禁用，授权已撤销 |
+| 后端临时异常 | 其他所有错误（网络超时、LDAP连接失败、数据库错误等） | ❌ 不失效（invalid=false） | 避免因后端抖动导致用户大规模掉线，保证可用性 |
+
+**设计权衡**：
+- **安全性**：用户被删除/禁用时立即失效，防止越权访问
+- **可用性**：后端临时故障时保持用户登录状态，避免雪崩效应
+- **风险控制**：配合 `RefreshInterval` 配置，定期检查，最终会在下一次成功检查时发现问题
 
 #### 4.2.3 Session-Username 头部劫持检测
 
@@ -493,7 +757,7 @@ if isAnonymous && userSession.AuthenticationLevel(...) != authentication.NotAuth
 func handleAuthnCookieValidate(ctx AuthzContext, manager session.Manager, userSession *session.UserSession, ...) (modified, invalid bool) {
     // 1. 认证级别异常检查
     // 2. 非活动超时检查
-    // 3. 用户信息刷新检查
+    // 3. 用户信息刷新检查（含错误处理）
     // 4. Session-Username头部检查
     
     if invalid {
@@ -521,14 +785,167 @@ if modified, invalid := handleAuthnCookieValidate(ctx, manager, &userSession, s.
     }
     
     return authn, nil  // 返回未认证状态
+} else if modified {
+    if err = manager.SaveSession(userSession); err != nil {
+        ctx.Logger.WithError(err).Error("Unable to save updated user session")
+    }
 }
 ```
 
 ---
 
-## 5. 会话续期机制
+## 5. 域名匹配、重定向安全检查、会话销毁与重建的完整约束链路
 
-### 5.1 Remember Me 续期
+### 5.1 完整约束链路图
+
+```
+请求到达
+  ↓
+1. 获取目标URL (X-Original-URL / X-Forwarded-* 头)
+  ↓
+2. 域名匹配 [GetCookieDomainFromTargetURI()]
+  ├─ 按配置顺序遍历cookies
+  ├─ 调用 HasDomainSuffix() 匹配
+  └─ 返回第一个匹配的域名 / 无匹配返回空
+  ↓
+3. 匹配失败处理
+  ├─ 返回错误："no configured session cookie domain matches"
+  └─ 终止后续流程
+  ↓
+4. 获取会话提供者 [GetSessionProviderByTargetURI()]
+  ↓
+5. 获取会话 [GetSession()]
+  ├─ 从cookie读取sessionID
+  ├─ 从存储后端读取会话数据
+  ├─ 反序列化为UserSession
+  ↓
+6. 域绑定验证
+  ├─ 检查 userSession.CookieDomain == provider.Config.Domain
+  ├─ 不匹配 → 销毁会话 → 创建新匿名会话 → 继续流程
+  └─ 匹配 → 继续流程
+  ↓
+7. 会话有效性验证 [handleAuthnCookieValidate()]
+  ├─ 7.1 认证级别异常检查
+  ├─ 7.2 非活动超时检查
+  ├─ 7.3 用户信息刷新检查（含两种错误处理）
+  ├─ 7.4 Session-Username头部检查
+  ├─ 无效 → 销毁会话 → 创建新匿名会话 → 返回未认证
+  └─ 有效 → 继续流程
+  ↓
+8. 重定向安全检查 [IsSafeRedirectionTargetURI()]
+  ├─ 检查URL是否为HTTPS
+  ├─ 调用 GetCookieDomainFromTargetURI() 检查域名是否在配置中
+  └─ 不安全 → 拒绝重定向 / 安全 → 允许重定向
+  ↓
+9. 正常业务处理
+```
+
+### 5.2 关键约束节点详解
+
+#### 5.2.1 节点1：域名匹配
+
+**入口**：`GetCookieDomainFromTargetURI()` [authelia_context.go:251]
+
+**约束**：
+- 必须配置至少一个匹配的cookie域名
+- 按配置顺序匹配，第一个匹配生效
+- 匹配失败则所有后续操作无法进行
+
+**错误处理**：
+```go
+if domain == "" {
+    return nil, fmt.Errorf("no configured session cookie domain matches the url '%s'", targetURL)
+}
+```
+
+#### 5.2.2 节点2：域绑定验证
+
+**入口**：`GetSession()` [authelia_context.go:392] 和 `CookieSessionAuthnStrategy.Get()` [handler_authz_authn.go:103]
+
+**约束**：
+- 会话中存储的 `CookieDomain` 必须与当前请求域名完全一致
+- 即使cookie值相同，跨域使用也会被检测到
+
+**安全动作**：
+- 销毁可疑会话
+- 创建新的匿名会话
+- 记录警告日志
+
+#### 5.2.3 节点3：重定向安全检查
+
+**入口**：`IsSafeRedirectionTargetURI()` [authelia_context.go:286]
+
+**约束**：
+```go
+func (ctx *AutheliaCtx) IsSafeRedirectionTargetURI(targetURI *url.URL) bool {
+    if targetURI == nil {
+        return false
+    }
+    // 约束1：必须是HTTPS
+    if !utils.IsURISecure(targetURI) {
+        return false
+    }
+    // 约束2：必须在配置的cookie域名范围内
+    return ctx.GetCookieDomainFromTargetURI(targetURI) != ""
+}
+```
+
+**调用场景**：
+- 注销后的重定向目标检查
+- 登录后的重定向目标检查
+- 所有涉及外部跳转的场景
+
+#### 5.2.4 节点4：会话销毁与重建
+
+**销毁入口**：
+- 主动注销：`ctx.DestroySession()` → `provider.DestroySession()`
+- 域绑定验证失败：`provider.DestroySession()`
+- 会话验证失效：`manager.DestroySession()`
+
+**销毁流程**：
+```
+DestroySession()
+  ↓
+sessionHolder.Destroy(ctx)  // fasthttp/session库
+  ↓
+provider.Destroy(sessionID)  // 存储后端
+  ├─ Memory: db.LoadAndDelete(key)
+  └─ Redis: DEL key
+  ↓
+设置过期cookie（Max-Age=-1）清除浏览器cookie
+```
+
+**重建流程**：
+```
+NewDefaultUserSession()
+  ↓
+userSession.CookieDomain = p.Config.Domain  // 绑定当前域名
+  ↓
+SaveSession()  // 保存到存储后端
+  ↓
+返回新的匿名会话
+```
+
+### 5.3 约束链路的安全设计
+
+| 约束节点 | 防护目标 | 绕过后果 |
+|---------|---------|---------|
+| 域名匹配 | 确保请求在预期的域名范围内 | 未配置的域名无法创建会话 |
+| 域绑定验证 | 防止cookie跨域迁移 | 攻击者可将A域cookie用于B域 |
+| 会话验证 | 检测多种会话异常状态 | 过期/失效会话继续有效 |
+| 重定向安全检查 | 防止钓鱼攻击 | 用户被重定向到恶意网站 |
+
+**设计特点**：
+1. **多层防御**：每个节点独立校验，失败即终止
+2. **fail-close**：校验失败时创建匿名会话而非放行
+3. **可观测性**：所有安全事件都有日志记录
+4. **一致性**：多个入口（GetSession / CookieSessionAuthnStrategy）采用相同验证逻辑
+
+---
+
+## 6. 会话续期机制
+
+### 6.1 Remember Me 续期
 
 **登录时设置**：`FirstFactorPasswordPOST()` [internal/handlers/handler_firstfactor_password.go:123-136]
 
@@ -549,13 +966,22 @@ userSession.SetOneFactorPassword(ctx.GetClock().Now(), details, keepMeLoggedIn)
 
 ```go
 func (p *Session) UpdateExpiration(ctx *fasthttp.RequestCtx, expiration time.Duration) (err error) {
-    store, _ := p.sessionHolder.Get(ctx)
+    var store *session.Store
+
+    if store, err = p.sessionHolder.Get(ctx); err != nil {
+        return err
+    }
+
     err = store.SetExpiration(expiration)  // 更新存储中的过期时间
+    if err != nil {
+        return err
+    }
+
     return p.sessionHolder.Save(ctx, store) // 保存并更新cookie
 }
 ```
 
-### 5.2 常规会话续期
+### 6.2 常规会话续期
 
 **非Remember Me会话**：
 - 每次请求更新 `LastActivity` 时间戳
@@ -567,7 +993,7 @@ func (p *Session) UpdateExpiration(ctx *fasthttp.RequestCtx, expiration time.Dur
 - Cookie过期时间为 `RememberMe` 配置（默认30天）
 - 会话有效期内持续有效，直到Cookie自然过期
 
-### 5.3 用户信息刷新续期
+### 6.3 用户信息刷新续期
 
 **刷新机制**：`handleSessionValidateRefresh()` [internal/handlers/handler_authz_authn.go:498-555]
 
@@ -585,7 +1011,7 @@ func handleSessionValidateRefresh(ctx AuthzContext, userSession *session.UserSes
     
     // 从后端获取最新用户信息
     details, err := ctx.GetProviders().UserProvider.GetDetails(userSession.Username)
-    // ... 错误处理 ...
+    // ... 错误处理（详见4.2.2节） ...
     
     // 更新下次刷新时间
     if !refresh.Always() {
@@ -605,7 +1031,7 @@ func handleSessionValidateRefresh(ctx AuthzContext, userSession *session.UserSes
 
 ---
 
-## 6. 登录时会话发放流程
+## 7. 登录时会话发放流程
 
 **完整流程**：`FirstFactorPasswordPOST()` [internal/handlers/handler_firstfactor_password.go:89-149]
 
@@ -647,9 +1073,9 @@ provider.SaveSession(ctx.RequestCtx, userSession)
 
 ---
 
-## 7. 核心数据结构
+## 8. 核心数据结构
 
-### 7.1 UserSession 结构
+### 8.1 UserSession 结构
 
 ```go
 // internal/session/types.go:20-48
@@ -680,22 +1106,28 @@ type UserSession struct {
 }
 ```
 
-### 7.2 会话数据存储结构
+### 8.2 会话数据存储结构（修正后）
 
 ```
-fasthttp/session Store (Dict)
+Authelia Store (Dict)
   └─ Key: "UserSession"
-     └─ Value: JSON序列化的UserSession对象
+     └─ Value: JSON([]byte) 序列化的 UserSession 对象
+           ├─ CookieDomain: "example.com"
+           ├─ Username: "john"
+           ├─ ... 其他字段
+           └─ ⚠️ 新会话首次存储时是 UserSession 对象，SaveSession 后变为 []byte
 ```
 
 **Redis存储时**：
 - Key: `authelia-session<session-id>`
-- Value: AES-GCM加密(Msgpack序列化(Dict))
-- 过期时间：会话Expiration配置
+- Value: AES-GCM(Msgpack(Dict{
+    "UserSession": JSON(UserSession)
+  }))
+- 过期时间：会话 Expiration 配置
 
 ---
 
-## 8. 关键安全设计总结
+## 9. 关键安全设计总结
 
 | 安全机制 | 实现位置 | 防护目标 |
 |---------|---------|---------|
@@ -706,12 +1138,14 @@ fasthttp/session Store (Dict)
 | SameSite策略 | 可配置Strict/Lax/None | 防止CSRF攻击 |
 | Redis存储加密 | EncryptingSerializer | 防止Redis数据泄露 |
 | 非活动超时 | handleAuthnCookieValidateInactivity() | 减少遗忘会话风险 |
-| 用户信息刷新 | handleSessionValidateRefresh() | 及时感知用户删除/禁用 |
+| 用户信息刷新错误分类 | handleSessionValidateRefresh() | 平衡安全性与可用性 |
+| 重定向安全检查 | IsSafeRedirectionTargetURI() | 防止钓鱼攻击 |
+| 配置顺序匹配 | GetCookieDomainFromTargetURI() | 确保正确的域名路由 |
 | 安全随机ID | SessionIDGeneratorFunc | 防止会话ID猜测 |
 
 ---
 
-## 9. 代码引用索引
+## 10. 代码引用索引
 
 | 功能 | 文件位置 |
 |------|---------|
@@ -722,8 +1156,14 @@ fasthttp/session Store (Dict)
 | 加密序列化器 | `internal/session/encrypting_serializer.go:12-66` |
 | 内存存储实现 | `internal/session/memory/provider.go` |
 | 域名匹配算法 | `internal/utils/url.go:57-71` |
+| 域名匹配入口 | `internal/middlewares/authelia_context.go:251-265` |
 | 域绑定验证 | `internal/middlewares/authelia_context.go:392-404` |
+| 域绑定验证（授权路径） | `internal/handlers/handler_authz_authn.go:103-115` |
+| 重定向安全检查 | `internal/middlewares/authelia_context.go:286-296` |
 | 注销处理器 | `internal/handlers/handler_logout.go:19-46` |
 | 会话验证逻辑 | `internal/handlers/handler_authz_authn.go:451-555` |
+| 用户刷新错误处理 | `internal/handlers/handler_authz_authn.go:515-525` |
 | 登录会话发放 | `internal/handlers/handler_firstfactor_password.go:89-149` |
+| 会话读写逻辑 | `internal/session/session.go:30-78` |
 | UserSession结构 | `internal/session/types.go:20-48` |
+| 多cookie域测试配置 | `internal/suites/MultiCookieDomain/configuration.yml` |
