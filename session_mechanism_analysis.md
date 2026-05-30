@@ -333,12 +333,39 @@ func (e *EncryptingSerializer) Decode(dst *session.Dict, src []byte) (err error)
 
 在深入分析之前，需要理解 `sessionHolder`（即 `*session.Session`）的核心行为：
 
+**源码依据**：`github.com/fasthttp/session/v2 v2.5.9` [session.go]
+
 | 方法 | 行为 |
 |------|------|
-| `sessionHolder.Get(ctx)` | 1. 从请求 cookie 读取 session ID<br>2. 从后端存储加载数据到内存 store<br>3. 如果没有 session ID 或加载失败，创建新的空 store<br>4. **可能设置新的 session cookie**（如果是新会话） |
-| `sessionHolder.Save(ctx, store)` | 1. 将内存中的 store 序列化（如果有 EncodeFunc）<br>2. 保存到后端存储<br>3. 设置/更新 session cookie（包括过期时间） |
+| `sessionHolder.Get(ctx)` | 1. 从请求 cookie 读取 session ID<br>2. 从 provider 加载已编码数据，通过 `DecodeFunc` 反序列化到新 store<br>3. 无 session ID 时生成新 ID，创建空 store<br>4. **不设置 cookie**（cookie 由 Save/Regenerate 设置）<br>5. **不向 provider 写入数据** |
+| `sessionHolder.Save(ctx, store)` | 1. 调用 `EncodeFunc(store.GetAll())` 编码 store 全部数据<br>2. 调用 `provider.Save(id, data, expiration)` 写入后端<br>3. 调用 `setHTTPValues()` 设置/更新 cookie<br>4. 调用 `store.Reset()` 重置 store 并放回 pool |
+| `sessionHolder.Regenerate(ctx)` | 1. 从 cookie 读取旧 session ID<br>2. 生成新 session ID<br>3. 调用 `provider.Regenerate(oldID, newID, expiration)` **仅在 provider 层面搬移已编码数据**<br>4. 调用 `setHTTPValues()` 更新 cookie 为新 ID<br>5. **不操作内存 store**，**不调用 EncodeFunc** |
+| `sessionHolder.Destroy(ctx)` | 1. 从 cookie 读取 session ID<br>2. 调用 `provider.Destroy(sessionID)` 删除后端数据<br>3. 调用 `delHTTPValues()` 删除 cookie |
 
-**关键洞察**：`sessionHolder.Get()` 可能已经设置了 cookie，但如果不调用 `sessionHolder.Save()`，数据不会持久化到后端。
+**关键事实**（代码已验证）：
+
+1. `Regenerate()` **不会**持久化当前内存 store 的内容。它只在 provider 层面将旧 session ID 关联的已编码数据搬移到新 session ID 下。如果旧 ID 在 provider 中没有数据（因为从未调用 `Save()`），则 `provider.Regenerate()` 什么也不做——只是更新了 cookie
+2. `Save()` 是**唯一**将内存 store 数据持久化到后端的方法。它负责编码、保存和设置 cookie
+3. `Get()` 创建的 store 对象在 `Save()` 调用后会被回收到 pool；如果未调用 `Save()`，store 对象将成为不可达的垃圾
+
+**provider.Regenerate() 的实际行为**（以内存 provider 为例）：
+
+```go
+// internal/session/memory/provider.go:72-87
+func (p *Provider) Regenerate(id, newID []byte, expiration time.Duration) error {
+    key := p.getSessionKey(id)
+    data, found := p.db.LoadAndDelete(key)  // 读取旧key的已编码数据
+    if found && data != nil {
+        item := data.(*item)
+        item.lastActiveTime = time.Now().UnixNano()
+        item.expiration = expiration
+        newKey := p.getSessionKey(newID)
+        p.db.Store(newKey, item)  // 搬到新key下
+    }
+    // 如果 found==false（旧key无数据），什么也不做
+    return nil
+}
+```
 
 #### 2.5.2 Authelia 层面的存储流程
 
@@ -454,72 +481,87 @@ store.Get("UserSession") → 不存在，ok=false
 - 后续代码路径中没有调用 `SaveSession()`
 - 此场景发生在：访问 bypass 策略的公开页面，授权验证中会话未被修改的路径
 
-**与场景2的关系**（事实）：场景1是场景2的必要前提——只有先经过 `GetSession()` 的 `!ok` 分支（场景1的触发条件），才可能在后续流程中因调用 `sessionHolder.Save()` 的其他方法（如 `UpdateExpiration()` 或 `RegenerateSession()`）而触发场景2
+**与场景2的关系**（事实）：场景1是场景2的根本原因——因为 `GetSession()` 不持久化数据，后续 `UpdateExpiration()` 获取的 store 是空的，持久化的也是空数据。两个场景是同一根本问题（GetSession 不持久化）的不同表现
 
 ---
 
-##### 场景2：已持久化但类型不匹配导致失败
+##### 场景2：UpdateExpiration 持久化空 store
 
-**时序**：
+**时序**（Passkey 登录 + Remember Me 场景）：
 
 ```
-请求1（新用户访问，存在间接持久化路径）
+请求1（Passkey 登录流程）
   ↓
-sessionHolder.Get(ctx) → 创建新 store，可能设置 cookie
+步骤A: provider.GetSession(ctx.RequestCtx)
+  ├─ sessionHolder.Get(ctx) → 新 store（provider 中无数据）
+  ├─ store.Get("UserSession") → 不存在，ok=false
+  ├─ store.Set("UserSession", userSession) → 内存中存储 UserSession 对象
+  ├─ 未调用 sessionHolder.Save() → store 对象不可达后被 GC 回收
+  └─ 返回 userSession
   ↓
-store.Get("UserSession") → 不存在，ok=false
+步骤B: ctx.RegenerateSession()
+  ├─ sessionHolder.Regenerate(ctx)
+  ├─ 从 cookie 读取旧 session ID
+  ├─ provider.Regenerate(oldID, newID, ...) → 旧 ID 无数据，什么也不做
+  └─ 更新 cookie 为新 session ID
+  ⚠️ Regenerate 不操作内存 store，不持久化任何数据
   ↓
-store.Set("UserSession", userSession) → 存储 UserSession 对象（内存中）
+步骤C: provider.UpdateExpiration(ctx.RequestCtx, RememberMe)
+  ├─ sessionHolder.Get(ctx) → 获取新的空 store（provider 中仍无数据）
+  ├─ store.SetExpiration(RememberMe)
+  └─ sessionHolder.Save(ctx, store)
+      ├─ EncodeFunc(store.GetAll()) → 编码空 Dict（无 "UserSession" 键）
+      └─ provider.Save(newID, encodedEmptyDict, RememberMe) → 持久化空数据
+  ⚠️ 持久化的是空 store，不包含 "UserSession" 键，因此不存在类型不匹配问题
   ↓
-✅ 某个代码路径间接调用了 sessionHolder.Save(store)
-  ├─ 已确认的触发点1: RegenerateSession()（Passkey 登录流程）
-  ├─ 已确认的触发点2: UpdateExpiration()（Remember Me 设置时）
-  └─ 注意: 这些方法会 Save 整个 store，包括类型错误的 UserSession 对象
+步骤D: userSession.SetOneFactorPasskey(...) → 修改内存 userSession 变量
   ↓
-UserSession 对象被序列化（Msgpack + AES-GCM）并持久化到后端
-  ↓
-请求结束
-
-========== 分割线 ==========
-
-请求2（同一用户，携带 session cookie）
-  ↓
-sessionHolder.Get(ctx)
-  ├─ 从 cookie 读取 session ID
-  └─ 从后端加载数据 → 获取到序列化后的 UserSession 对象
-  ↓
-反序列化后，store.Get("UserSession") 返回的不是 []byte 类型
-  ↓
-类型断言 .([]byte) 失败 → ok=false
-  ↓
-重新走初始化路径
+步骤E: defer ctx.SaveSession(userSession)
+  ├─ sessionHolder.Get(ctx) → 获取新 store（provider 中有步骤C保存的空数据）
+  ├─ json.Marshal(userSession) → []byte
+  ├─ store.Set("UserSession", userSessionJSON) → 正确类型
+  └─ sessionHolder.Save(ctx, store) → 持久化完整的认证会话数据 ✅
 ```
 
-**根本原因**：
-1. `GetSession()` 存储的是 `UserSession` 对象
-2. `SaveSession()` 存储的是 `json.Marshal()` 后的 `[]byte`
-3. 如果某个路径在 `GetSession()` 之后调用了 `sessionHolder.Save()`，就会将错误类型持久化
-
-**触发条件**（事实）：
-- 先调用 `GetSession()`（创建新会话，`ok=false` 分支）
-- 然后调用会间接执行 `sessionHolder.Save()` 的方法
-- 已确认的代码路径：Passkey 登录中的 `RegenerateSession()` 和 `UpdateExpiration()`（详见第 7.4 节）
+**事实**（代码已验证）：
+1. `RegenerateSession()` 在 Passkey 流程中**不会**持久化内存 store 的内容
+2. `UpdateExpiration()` 在 Passkey 流程中通过新的 `sessionHolder.Get()` 获取独立 store，该 store 是空的（因为之前没有 `Save()`），持久化的也是空数据
+3. 上述流程中**不存在**将 `UserSession` 对象类型错误地持久化到后端的路径
+4. defer 中的 `SaveSession()` 最终将正确类型（`[]byte`）的完整会话数据持久化
 
 **推断**（需进一步验证）：
-- 类型不匹配是否真正导致反序列化失败，取决于 Msgpack 的序列化/反序列化行为
-- **边界条件**：如果 Msgpack 将 `UserSession` 结构体序列化后恢复为 `map[string]interface{}`，则 `.([]byte)` 断言也会失败；如果 Msgpack 保留原始类型信息，则可能恢复为 `UserSession` 对象，但 `.([]byte)` 仍然失败
+- 如果在 `GetSession()` 和 `UpdateExpiration()` 之间，有代码直接调用了 `sessionHolder.Save(ctx, store)` 并传入了包含 UserSession 对象的 store，才可能触发类型不匹配。但当前 Passkey 流程中**不存在**这样的代码路径
+- 类型不匹配风险的触发条件被重新限定为：需要有一个代码路径在 `GetSession()` 的 `!ok` 分支后、`SaveSession()` 前，**直接获取并保存**了包含 UserSession 对象的 store。当前已知的 Authelia 代码中不存在此路径
+
+**与前次分析的对比**：
+
+| 维度 | 前次分析（错误） | 本次分析（修正后） |
+|------|------------------|-------------------|
+| Regenerate 是否持久化内存 store | 是（错误描述） | **否**（只操作 provider 层面） |
+| UpdateExpiration 中 store 的数据来源 | 复用 GetSession 的 store | **新建独立 store**，从 provider 加载 |
+| Passkey 流程是否存在类型不匹配风险 | 存在 | **不存在**（在当前代码路径下） |
+| 场景2的实际触发条件 | GetSession + Regenerate/UpdateExpiration | 需要直接对包含 UserSession 对象的 store 调用 sessionHolder.Save |
 
 #### 2.5.4 两种场景对比总结
 
-| 维度 | 场景1：未持久化导致重建 | 场景2：已持久化但类型不匹配导致失败 |
-|------|------------------------|--------------------------------------|
-| 后端数据状态 | 空（从未持久化） | 有数据但类型错误 |
-| 触发条件 | 只调用 GetSession() 不调用 SaveSession()，且无其他间接持久化路径 | GetSession() 后调用 RegenerateSession() 或 UpdateExpiration()，但未先调用 SaveSession() |
-| 已确认的代码路径 | 授权验证中 bypass 策略的只读路径（事实） | Passkey 登录流程（事实，详见第 7.4 节） |
-| 根本原因 | 缺少 sessionHolder.Save() 调用 | GetSession() 存入 UserSession 对象，被间接持久化 |
-| 后续影响 | 每次请求都重新初始化，无持久副作用 | 一次错误持久化，后续持续类型断言失败 |
-| 恢复方式 | 调用 SaveSession() 后正常 | 调用 SaveSession() 覆盖错误数据后恢复 |
-| 场景间关系 | 场景1是场景2的必要前提 | 场景2是场景1的升级：从"未持久化"变为"持久化了错误类型" |
+| 维度 | 场景1：未持久化导致重建 | 场景2：UpdateExpiration 持久化空 store |
+|------|------------------------|----------------------------------------|
+| 后端数据状态 | 空（从未持久化） | 有数据但为空 Dict（无 "UserSession" 键） |
+| 触发条件 | 只调用 GetSession() 不调用 SaveSession()，且无其他间接持久化路径 | GetSession() 后调用 UpdateExpiration()，但未先调用 SaveSession() |
+| 已确认的代码路径 | 授权验证中 bypass 策略的只读路径（事实） | Passkey 登录 + Remember Me 流程（事实） |
+| 根本原因 | 缺少 sessionHolder.Save() 调用 | UpdateExpiration() 通过新的 Get() 获取空 store 并持久化 |
+| 后续影响 | 每次请求都重新初始化，无持久副作用 | 后端存储了空数据，defer SaveSession() 会覆盖为正确数据 |
+| 恢复方式 | 调用 SaveSession() 后正常 | defer 中的 SaveSession() 自动覆盖 |
+| 场景间关系 | 场景1是更根本的问题：GetSession() 不持久化 | 场景2是场景1的衍生：因为未持久化，后续 Save 操作写入的是空数据 |
+
+**关于类型不匹配风险的结论**：
+
+前次分析认为 `RegenerateSession()` 和 `UpdateExpiration()` 会间接持久化 `UserSession` 对象类型的数据，这是**错误**的。修正后的结论：
+
+- `RegenerateSession()` 只在 provider 层面操作已编码数据，**不涉及内存 store**
+- `UpdateExpiration()` 通过新的 `sessionHolder.Get()` 获取独立 store，该 store 从 provider 加载数据。如果 provider 中无数据，store 是空的；如果 provider 中有数据（已通过 `SaveSession()` 保存），则加载的是正确类型 `[]byte`
+- 因此在当前 Authelia 代码中，**不存在**将 `UserSession` 对象类型错误地持久化到后端的路径
+- 类型不匹配的理论风险仍然存在（`GetSession()` 的 `!ok` 分支写入 `UserSession` 对象到 store，而 `SaveSession()` 写入 `[]byte`），但需要一个非常特定的条件：某段代码在 `GetSession()` 后获取了包含 `UserSession` 对象的 store 引用，然后直接调用 `sessionHolder.Save()` 保存它。当前代码中不存在此路径
 
 #### 2.5.5 fasthttp/session 层面的序列化
 
@@ -1054,16 +1096,17 @@ SaveSession()  // 保存到存储后端
 1. **密码登录流程**：
    ```
    DestroySession() → SaveSession()（空会话，转为[]byte）
-   → RegenerateSession() → UpdateExpiration()（可选）
+   → RegenerateSession()（provider 中有数据，搬移到新 ID）
+   → UpdateExpiration()（可选，加载并重新持久化已有数据）
    → SaveSession()（最终会话）
    ```
 
 2. **Passkey 登录流程**：
    ```
-   GetSession()（匿名用户，!ok分支，存入UserSession对象）
-   → RegenerateSession()（⚠️ 间接持久化UserSession对象类型）
-   → UpdateExpiration()（可选，⚠️ 再次持久化UserSession对象类型）
-   → SetOneFactorPasskey()（仅修改内存对象）
+   GetSession()（匿名用户，!ok分支，存入UserSession对象到内存store）
+   → RegenerateSession()（provider 中无数据，仅更新 cookie）
+   → UpdateExpiration()（可选，加载空 store 并持久化空 Dict）
+   → SetOneFactorPasskey()（仅修改内存变量）
    → defer SaveSession()（最终转为[]byte并持久化）
    ```
 
@@ -1073,9 +1116,13 @@ SaveSession()  // 保存到存储后端
    - 会话有修改（modified=true）→ SaveSession()（更新会话）
 
 4. **Remember Me 续期**：
-   - UpdateExpiration() → sessionHolder.Save()（持久化整个store）
+   - UpdateExpiration() → sessionHolder.Get() + sessionHolder.Save()
 
-**关键差异**：密码登录流程在 `RegenerateSession()` 和 `UpdateExpiration()` 之前已通过 `SaveSession()` 将 "UserSession" 的值转为 `[]byte`，而 Passkey 登录流程在这些操作之前未调用 `SaveSession()`，导致可能持久化类型错误的数据。
+**关键差异**（事实）：
+- `RegenerateSession()` **不操作内存 store**，只在 provider 层面搬移已编码数据
+- `UpdateExpiration()` 通过新的 `sessionHolder.Get()` 获取独立 store，其数据来源是 provider 中已有的编码数据
+- 在密码登录中，`SaveSession()` 先于 `RegenerateSession()` 和 `UpdateExpiration()` 执行，确保 provider 中有数据
+- 在 Passkey 登录中，`SaveSession()` 在 defer 中执行，`RegenerateSession()` 和 `UpdateExpiration()` 操作时 provider 中无数据
 
 ---
 
@@ -1117,10 +1164,10 @@ func (p *Session) UpdateExpiration(ctx *fasthttp.RequestCtx, expiration time.Dur
 }
 ```
 
-**重要注意**：`UpdateExpiration()` 会调用 `sessionHolder.Save()` 持久化整个 store。其安全性取决于调用时 store 中 "UserSession" 键的值类型：
+**重要注意**：`UpdateExpiration()` 会调用 `sessionHolder.Get()` 获取新的独立 store，然后调用 `sessionHolder.Save()` 持久化。其安全性取决于调用时 provider 中已存储的数据状态：
 
-- **密码登录流程**（事实）：`SaveSession()` 在 `UpdateExpiration()` 之前执行，store 中已是 `[]byte` 类型，因此安全
-- **Passkey 登录流程**（事实）：`SaveSession()` 在 defer 中执行，晚于 `UpdateExpiration()`，store 中仍是 `UserSession` 对象，存在类型不匹配风险（详见第 7.4 节）
+- **密码登录流程**（事实）：`SaveSession()` 在 `UpdateExpiration()` 之前执行，provider 中已有正确类型 `[]byte` 的会话数据，`UpdateExpiration()` 加载并重新持久化的数据类型正确
+- **Passkey 登录流程**（事实）：`SaveSession()` 在 defer 中执行，晚于 `UpdateExpiration()`，provider 中无数据，`UpdateExpiration()` 加载空 store 并持久化空 Dict。不存在类型不匹配风险（详见第 7.4 节）
 
 ### 6.2 常规会话续期
 
@@ -1244,11 +1291,12 @@ Authelia 支持两种主要的一因子认证方式：密码登录和 Passkey �
 步骤1: provider, _ = ctx.GetSessionProvider()
   ↓
 步骤2: userSession, _ = provider.GetSession(ctx.RequestCtx)
-  ├─ sessionHolder.Get() → 获取 store
+  ├─ sessionHolder.Get(ctx) → 获取 store（新会话：provider 无数据，store 为空）
   ├─ store.Get("UserSession").([]byte) → ok=false（匿名用户）
   ├─ userSession = NewDefaultUserSession()
-  ├─ store.Set("UserSession", userSession) → ⚠️ 存储的是 UserSession 对象
-  └─ 未调用 sessionHolder.Save() → 未持久化 ❌
+  ├─ store.Set("UserSession", userSession) → 内存 store 中存入 UserSession 对象
+  ├─ ❌ 未调用 sessionHolder.Save() → 数据未持久化
+  └─ store 对象随 GetSession 返回后不可达，被 GC 回收
   ↓
 步骤3: defer func() {
         userSession.WebAuthn = nil
@@ -1261,27 +1309,27 @@ Authelia 支持两种主要的一因子认证方式：密码登录和 Passkey �
 步骤5: 获取用户详情、检查封禁
   ↓
 步骤6: ctx.RegenerateSession()
-  ├─ 重新生成 session ID
-  └─ 持久化：sessionHolder.Regenerate() → 旧ID数据迁移到新ID
-      ⚠️ 此时 store 中 "UserSession" 的值仍然是 UserSession 对象（来自步骤2）
-      Regenerate 会调用 sessionHolder.Save() 持久化当前 store
-      因此 Regenerate 后，后端中存储了类型错误的 UserSession 对象
+  ├─ sessionHolder.Regenerate(ctx)
+  │   ├─ 从 cookie 读取旧 session ID
+  │   ├─ provider.Regenerate(oldID, newID, ...) → 旧 ID 无数据，什么也不做
+  │   └─ 更新 cookie 为新 session ID
+  └─ ⚠️ Regenerate 不操作内存 store，不持久化任何数据（详见 2.5.1 节）
   ↓
 步骤7: keepMeLoggedIn 判断
   ├─ if keepMeLoggedIn:
   │   provider.UpdateExpiration(ctx.RequestCtx, provider.Config.RememberMe)
-  │   ├─ sessionHolder.Get() → 获取 store
+  │   ├─ sessionHolder.Get(ctx) → 获取新的空 store（provider 中无数据）
   │   ├─ store.SetExpiration(RememberMe)
-  │   └─ sessionHolder.Save() → 持久化 ✅
-  │       此时 store 中 "UserSession" 的值仍然是 UserSession 对象
-  │       ⚠️ 再次持久化了类型错误的数据
+  │   └─ sessionHolder.Save(ctx, store) → 持久化空 Dict + 设置 cookie
+  │       ⚠️ 持久化的是空 store，不含 "UserSession" 键
+  │       此为场景2（详见 2.5.3 节），不影响后续 defer SaveSession 的正确性
   └─ else: 不调用
   ↓
 步骤8: userSession.SetOneFactorPasskey(...)
-  └─ 仅修改内存中的 userSession 对象，未持久化
+  └─ 仅修改内存中的 userSession 变量，不涉及 store
   ↓
 步骤9: userSession.RefreshTTL = ...（如果配置了刷新间隔）
-  └─ 仅修改内存对象，未持久化
+  └─ 仅修改内存变量
   ↓
 步骤10: 响应处理
   ↓
@@ -1289,9 +1337,10 @@ Authelia 支持两种主要的一因子认证方式：密码登录和 Passkey �
 步骤11: defer 执行
   ├─ userSession.WebAuthn = nil
   └─ ctx.SaveSession(userSession)
+      ├─ sessionHolder.Get(ctx) → 获取 store（从 provider 加载步骤7保存的空数据）
       ├─ json.Marshal(userSession) → []byte ✅ 正确类型
       ├─ store.Set("UserSession", userSessionJSON)
-      └─ sessionHolder.Save() → 持久化 ✅ 最终会话数据（类型正确）
+      └─ sessionHolder.Save(ctx, store) → 持久化 ✅ 最终会话数据（类型正确）
 ```
 
 ### 7.3 两种登录流程的关键差异对比
@@ -1301,30 +1350,32 @@ Authelia 支持两种主要的一因子认证方式：密码登录和 Passkey �
 | 旧会话销毁 | ✅ 步骤4: DestroySession() | ❌ 不调用 DestroySession() |
 | 空会话预存 | ✅ 步骤6: SaveSession(空会话) | ❌ 不调用 SaveSession(空会话) |
 | Session ID 重新生成 | 步骤7: RegenerateSession() | 步骤6: ctx.RegenerateSession() |
-| Regenerate 时 store 中 "UserSession" 值类型 | `[]byte`（已由步骤6转换） | `UserSession` 对象（来自 GetSession 的 !ok 分支） |
+| Regenerate 的实际效果 | provider 中有数据（步骤6已 Save），搬移数据到新 ID | provider 中无数据，Regenerate 只更新 cookie |
 | UpdateExpiration 前是否已 SaveSession | ✅ 是（步骤6） | ❌ 否 |
-| UpdateExpiration 持久化的数据类型 | `[]byte`（类型正确） | `UserSession` 对象（类型错误⚠️） |
+| UpdateExpiration 持久化的数据 | 完整空会话（含 "UserSession" 键，值为 `[]byte`） | 空 Dict（无 "UserSession" 键） |
 | 最终 SaveSession 调用方式 | 显式调用 provider.SaveSession() | defer 中的 ctx.SaveSession() |
 | 会话固定保护 | Destroy + Save + Regenerate | 仅 Regenerate（依赖旧 cookie 不含有效认证状态） |
 
-### 7.4 Passkey 流程中的类型不匹配风险分析
+### 7.4 Passkey 流程中的类型不匹配风险重新评估
 
-**事实**（基于代码可验证）：
+**事实**（代码已验证）：
 
-1. `FirstFactorPasskeyPOST()` 在调用 `provider.GetSession()` 后，如果用户是匿名状态，走的是 `GetSession()` 的 `!ok` 分支，向内存 store 中写入了 `UserSession` 对象
-2. `ctx.RegenerateSession()` 内部会调用 `sessionHolder.Regenerate()`，该方法会将当前 store 的数据保存到新 session ID 下
-3. 因此，`RegenerateSession()` 之后，后端存储中 "UserSession" 键的值类型为 `UserSession` 对象而非 `[]byte`
-4. 如果同时启用了 Remember Me，`UpdateExpiration()` 会再次持久化此类型错误的数据
+1. `RegenerateSession()` **不会**持久化当前内存 store 的内容。它只在 provider 层面搬移已编码数据。对于新会话（provider 中无数据），Regenerate 只更新 cookie，不写入任何数据
+2. `UpdateExpiration()` 通过**新的** `sessionHolder.Get()` 获取独立 store，该 store 从 provider 加载数据。如果 provider 中无数据，store 是空的；持久化的也是空 Dict
+3. 因此在当前 Passkey 登录流程中，**不存在**将 `UserSession` 对象类型错误地持久化到后端的路径
+4. 前次分析认为 `RegenerateSession()` 会持久化内存 store 的描述是**错误**的
+
+**类型不匹配的理论风险**（当前代码中不存在此路径）：
+
+类型不匹配的触发条件为：某段代码在 `GetSession()` 的 `!ok` 分支后，获取了包含 `UserSession` 对象的 store 引用，然后直接调用 `sessionHolder.Save()` 保存它。但当前 Authelia 代码中不存在此路径，原因：
+- `GetSession()` 返回 `UserSession` 值类型，不返回 store 引用
+- `SaveSession()` 总是先 `json.Marshal()` 再 `store.Set()`，确保类型正确
+- `UpdateExpiration()` 通过新的 `Get()` 获取独立 store
+- `RegenerateSession()` 不操作内存 store
 
 **推断**（需进一步验证）：
-
-- 上述类型不匹配在 Redis 存储后端下是否真正导致反序列化失败，取决于 Msgpack 对 Go 结构体的序列化/反序列化行为。当 `EncryptingSerializer.Decode()` 执行 `UnmarshalMsg()` 后恢复的 Dict 中 "UserSession" 键对应的值是否仍为 `UserSession` 结构体而非 `[]byte`，需要实际运行验证
-- **边界条件**：如果 Msgpack 将 `UserSession` 结构体序列化后再反序列化恢复为 `map[string]interface{}` 或其他类型，则 `.([]byte)` 断言也会失败；如果 Msgpack 保留原始类型信息则可能恢复为 `UserSession` 对象
-
-**缓解因素**：
-
-- defer 中的 `ctx.SaveSession(userSession)` 最终会以 `json.Marshal()` 生成 `[]byte` 覆盖 store，修正类型
-- 但如果 defer 之前发生 panic 或其他异常退出，类型错误的数据可能留在后端中
+- 如果未来新增代码在 `GetSession()` 后直接操作 `sessionHolder`（绕过 `SaveSession()`），可能触发类型不匹配
+- 此风险是代码设计层面的潜在问题（`GetSession()` 的 `!ok` 分支写入 `UserSession` 对象而非 `[]byte`），但在当前代码路径下不会触发
 
 ### 7.5 Passkey 流程不调用 DestroySession 的设计考量
 
@@ -1403,25 +1454,41 @@ Authelia Store (Dict)
            ├─ ... 其他默认字段
 ```
 
-**特点**：
+**特点**（事实）：
 - 仅存在于内存中，未持久化到后端
 - 存储类型为 `UserSession` 结构体，不是 `[]byte`
+- store 对象在 `GetSession()` 返回后不可达，被 GC 回收
 - 下次请求时，由于后端无数据，会重新初始化
 
-#### 8.2.3 类型不匹配的错误持久化状态
+#### 8.2.3 UpdateExpiration 持久化的空 store（Passkey + Remember Me 场景）
 
 ```
 后端存储（Redis/Memory）
+  └─ Key: "authelia-session<session-id>"
+     └─ Value: AES-GCM(Msgpack(Dict{}))
+         （空 Dict，不含 "UserSession" 键）
+```
+
+**特点**（事实）：
+- `UpdateExpiration()` 通过新的 `sessionHolder.Get()` 获取空 store（provider 中无数据），持久化后产生空 Dict
+- 不含 "UserSession" 键，不存在类型不匹配问题
+- 后续 defer 中的 `SaveSession()` 会覆盖为完整的认证会话数据
+
+#### 8.2.4 类型不匹配的理论状态（当前代码中不存在此路径）
+
+```
+理论上的后端存储（若 GetSession() 后直接对包含 UserSession 对象的 store 调用 sessionHolder.Save）
   └─ Key: "authelia-session<session-id>"
      └─ Value: AES-GCM(Msgpack(Dict{
          "UserSession": UserSession 对象（Msgpack序列化的结构体）
        }))
 ```
 
-**读取时**：
-- 反序列化后 `store.Get("UserSession")` 返回 `UserSession` 对象
-- 类型断言 `.([]byte)` 失败 → `ok=false` → 重新初始化
-- 需要调用 `SaveSession()` 覆盖为正确的 `[]byte` 类型
+**说明**（推断）：
+- 当前 Authelia 代码中**不存在**触发此状态的路径
+- 触发条件：某段代码在 `GetSession()` 的 `!ok` 分支后，获取了包含 `UserSession` 对象的 store 引用，然后直接调用 `sessionHolder.Save()` 保存它
+- `RegenerateSession()` 不操作内存 store，`UpdateExpiration()` 通过新的 `Get()` 获取独立 store，均不会触发此状态
+- 读取时：反序列化后 `store.Get("UserSession")` 返回的类型不是 `[]byte`，类型断言 `.([]byte)` 失败 → `ok=false` → 重新初始化
 
 ---
 
@@ -1442,9 +1509,9 @@ Authelia Store (Dict)
 | 安全随机ID | SessionIDGeneratorFunc | 防止会话ID猜测 |
 | 显式持久化控制 | SaveSession() 才调用 sessionHolder.Save() | 确保只有显式修改才持久化 |
 
-**注意**：代码中存在两个潜在问题（非安全漏洞，但影响可靠性）：
+**注意**：代码中存在以下潜在问题：
 1. `GetSession()` 新会话未立即持久化（详见 2.5.3 节场景1）——事实：代码中确实未调用 `sessionHolder.Save()`
-2. `GetSession()` 与 `SaveSession()` 存储类型不一致（详见 2.5.3 节场景2）——事实：`GetSession()` 存储 `UserSession` 对象，`SaveSession()` 存储 `[]byte`；推断：通过 Passkey 登录流程中的 `RegenerateSession()` 和 `UpdateExpiration()` 可触发类型不匹配的持久化
+2. `GetSession()` 与 `SaveSession()` 存储类型不一致（详见 2.5.4 节）——事实：`GetSession()` 的 `!ok` 分支存储 `UserSession` 对象，`SaveSession()` 存储 `[]byte`。推断：此类型不一致在当前代码路径下不会导致问题，因为 `RegenerateSession()` 不操作内存 store，`UpdateExpiration()` 通过新的 `Get()` 获取独立 store。但若未来新增代码直接操作 `sessionHolder` 可能触发
 
 ---
 
@@ -1458,6 +1525,11 @@ Authelia Store (Dict)
 | 存储后端创建 | `internal/session/provider_config.go:96-178` |
 | 加密序列化器 | `internal/session/encrypting_serializer.go:12-66` |
 | 内存存储实现 | `internal/session/memory/provider.go` |
+| 内存provider.Regenerate | `internal/session/memory/provider.go:72-87` |
+| fasthttp/session Session.Get | `github.com/fasthttp/session/v2@v2.5.9/session.go` |
+| fasthttp/session Session.Save | `github.com/fasthttp/session/v2@v2.5.9/session.go` |
+| fasthttp/session Session.Regenerate | `github.com/fasthttp/session/v2@v2.5.9/session.go` |
+| fasthttp/session Session.Destroy | `github.com/fasthttp/session/v2@v2.5.9/session.go` |
 | 域名匹配算法 | `internal/utils/url.go:57-71` |
 | 域名匹配入口 | `internal/middlewares/authelia_context.go:251-265` |
 | 域绑定验证 | `internal/middlewares/authelia_context.go:392-404` |
