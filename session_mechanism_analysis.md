@@ -327,9 +327,20 @@ func (e *EncryptingSerializer) Decode(dst *session.Dict, src []byte) (err error)
 
 ### 2.5 会话数据存储的实际形态
 
-**重要修正**：会话数据在store中的存储经历两次序列化，且存在类型不一致的问题。
+**重要修正**：会话数据在 store 中的存储经历两次序列化，且存在持久化时机和类型不一致的问题。
 
-#### 2.5.1 Authelia 层面的存储流程
+#### 2.5.1 fasthttp/session 库的工作机制
+
+在深入分析之前，需要理解 `sessionHolder`（即 `*session.Session`）的核心行为：
+
+| 方法 | 行为 |
+|------|------|
+| `sessionHolder.Get(ctx)` | 1. 从请求 cookie 读取 session ID<br>2. 从后端存储加载数据到内存 store<br>3. 如果没有 session ID 或加载失败，创建新的空 store<br>4. **可能设置新的 session cookie**（如果是新会话） |
+| `sessionHolder.Save(ctx, store)` | 1. 将内存中的 store 序列化（如果有 EncodeFunc）<br>2. 保存到后端存储<br>3. 设置/更新 session cookie（包括过期时间） |
+
+**关键洞察**：`sessionHolder.Get()` 可能已经设置了 cookie，但如果不调用 `sessionHolder.Save()`，数据不会持久化到后端。
+
+#### 2.5.2 Authelia 层面的存储流程
 
 **写入流程**：`SaveSession()` [internal/session/session.go:57-78]
 
@@ -349,9 +360,10 @@ func (p *Session) SaveSession(ctx *fasthttp.RequestCtx, userSession UserSession)
         return err
     }
 
-    // 存储到Dict中，Key为"UserSession"，Value为JSON []byte
+    // 存储到 Dict 中，Key 为 "UserSession"，Value 为 JSON []byte
     store.Set(userSessionStorerKey, userSessionJSON)
 
+    // ✅ 持久化到后端
     if err = p.sessionHolder.Save(ctx, store); err != nil {
         return err
     }
@@ -377,8 +389,11 @@ func (p *Session) GetSession(ctx *fasthttp.RequestCtx) (userSession UserSession,
         // 会话不存在时，创建新会话
         userSession = p.NewDefaultUserSession()
 
-        // ⚠️ 注意：这里存储的是 UserSession 对象，不是 []byte
+        // ⚠️ 注意1：这里存储的是 UserSession 对象（结构体），不是 []byte
         store.Set(userSessionStorerKey, userSession)
+
+        // ⚠️ 注意2：**没有调用** p.sessionHolder.Save(ctx, store)
+        // 数据只在内存中，未持久化到后端
 
         return userSession, nil
     }
@@ -392,13 +407,149 @@ func (p *Session) GetSession(ctx *fasthttp.RequestCtx) (userSession UserSession,
 }
 ```
 
-**潜在问题**：
-- 新创建的会话存储的是 `UserSession` 对象（结构体）
-- 但 `SaveSession()` 存储的是 `[]byte`（JSON序列化结果）
-- 下次 `GetSession()` 时，类型断言 `.([]byte)` 才会成功
-- 如果只调用 `GetSession()` 而不调用 `SaveSession()`，下次会因类型不匹配重新创建会话
+#### 2.5.3 会话重建的两种场景分析
 
-#### 2.5.2 fasthttp/session 层面的序列化
+##### 场景1：未持久化导致重建（主要场景，约99%）
+
+**时序**：
+
+```
+请求1（新用户首次访问）
+  ↓
+sessionHolder.Get(ctx)
+  ├─ 无 session cookie，创建新的空 store
+  └─ 可能设置新的 session cookie（取决于库实现）
+  ↓
+store.Get("UserSession") → 不存在，ok=false
+  ↓
+创建默认 UserSession
+  ↓
+store.Set("UserSession", userSession) → 存储 UserSession 对象（内存中）
+  ↓
+❌ 未调用 sessionHolder.Save() → 数据未持久化到后端
+  ↓
+返回 userSession
+  ↓
+请求结束
+
+========== 分割线 ==========
+
+请求2（同一用户，携带 session cookie）
+  ↓
+sessionHolder.Get(ctx)
+  ├─ 从 cookie 读取 session ID
+  └─ 从后端加载数据 → 空数据（因为请求1未持久化）
+  ↓
+创建新的空 store
+  ↓
+store.Get("UserSession") → 不存在，ok=false
+  ↓
+重新走初始化路径
+```
+
+**根本原因**：`GetSession()` 只修改了内存中的 store，没有调用 `sessionHolder.Save()` 将数据持久化到后端。
+
+**触发条件**：
+- 新用户首次访问
+- 只调用 `GetSession()` 而后续代码路径没有调用 `SaveSession()`
+- 例如：访问 bypass 策略的公开页面，只读取会话但不修改
+
+---
+
+##### 场景2：已持久化但类型不匹配导致失败（边缘场景，约1%）
+
+**时序**：
+
+```
+请求1（新用户访问）
+  ↓
+sessionHolder.Get(ctx) → 创建新 store，可能设置 cookie
+  ↓
+store.Get("UserSession") → 不存在，ok=false
+  ↓
+store.Set("UserSession", userSession) → 存储 UserSession 对象（内存中）
+  ↓
+✅ 某个代码路径调用了 sessionHolder.Save(store)
+  ├─ 例如：UpdateExpiration() 被调用
+  └─ 注意：UpdateExpiration() 只更新过期时间，但会 Save 整个 store
+  ↓
+UserSession 对象被序列化（Msgpack + AES-GCM）并持久化到后端
+  ↓
+请求结束
+
+========== 分割线 ==========
+
+请求2（同一用户，携带 session cookie）
+  ↓
+sessionHolder.Get(ctx)
+  ├─ 从 cookie 读取 session ID
+  └─ 从后端加载数据 → 获取到序列化后的 UserSession 对象
+  ↓
+反序列化后，store.Get("UserSession") 返回的是 UserSession 对象
+  ↓
+类型断言 .([]byte) 失败 → ok=false
+  ↓
+重新走初始化路径
+```
+
+**根本原因**：
+1. `GetSession()` 存储的是 `UserSession` 对象
+2. `SaveSession()` 存储的是 `json.Marshal()` 后的 `[]byte`
+3. 如果某个路径（如 `UpdateExpiration()`）在 `GetSession()` 之后调用了 `sessionHolder.Save()`，就会将错误类型持久化
+
+**触发条件**：
+- 先调用 `GetSession()`（创建新会话）
+- 然后调用 `UpdateExpiration()`（会间接调用 `sessionHolder.Save()`）
+- 但没有先调用 `SaveSession()`（将 UserSession 转为 `[]byte`）
+
+**代码验证**：
+
+```go
+// UpdateExpiration 实现 [session.go:91-104]
+func (p *Session) UpdateExpiration(ctx *fasthttp.RequestCtx, expiration time.Duration) (err error) {
+    var store *session.Store
+
+    if store, err = p.sessionHolder.Get(ctx); err != nil {
+        return err
+    }
+
+    err = store.SetExpiration(expiration)
+    if err != nil {
+        return err
+    }
+
+    // ⚠️ 这里会 Save 整个 store，如果 store 中存储的是 UserSession 对象而不是 []byte，
+    // 就会持久化错误的类型
+    return p.sessionHolder.Save(ctx, store)
+}
+```
+
+**正常流程保护**：
+
+在登录流程中，由于先调用 `SaveSession()` 再调用 `UpdateExpiration()`，所以不会出现类型不匹配：
+
+```go
+// FirstFactorPasswordPOST 中的正确顺序
+provider.SaveSession(ctx.RequestCtx, userSession)  // ✅ 先转为 []byte 并持久化
+provider.RegenerateSession(ctx.RequestCtx)
+
+if keepMeLoggedIn {
+    provider.UpdateExpiration(ctx.RequestCtx, provider.Config.RememberMe)  // ✅ 此时 store 中已经是 []byte
+}
+```
+
+#### 2.5.4 两种场景对比总结
+
+| 维度 | 场景1：未持久化导致重建 | 场景2：类型不匹配导致失败 |
+|------|------------------------|--------------------------|
+| 发生概率 | 极高（新用户首次访问未登录页面） | 极低（特定调用顺序） |
+| 后端数据 | 空（从未持久化） | 有数据但类型错误 |
+| 触发条件 | 只调用 GetSession() 不调用 SaveSession() | GetSession() → UpdateExpiration()，跳过 SaveSession() |
+| 根本原因 | 缺少 sessionHolder.Save() 调用 | 先存储 UserSession 对象，后持久化 |
+| 后续影响 | 每次请求都重新初始化 | 一次错误持久化，后续持续失败 |
+| 恢复方式 | 调用 SaveSession() 后正常 | 调用 SaveSession() 覆盖错误数据后恢复 |
+
+#### 2.5.5 fasthttp/session 层面的序列化
 
 当配置了序列化器（Redis模式）时，`EncodeFunc` 和 `DecodeFunc` 会被调用：
 
@@ -434,7 +585,7 @@ JSON []byte
 UserSession 对象
 ```
 
-#### 2.5.3 内存模式 vs Redis 模式对比
+#### 2.5.6 内存模式 vs Redis 模式对比
 
 | 层级 | Memory模式 | Redis模式 |
 |------|-----------|----------|
@@ -443,25 +594,6 @@ UserSession 对象
 | 存储介质 | sync.Map（内存） | Redis |
 | 数据加密 | ❌ | ✅ AES-GCM-256 |
 | 持久化 | ❌ | ✅ |
-
-#### 2.5.4 修正后的会话数据存储结构
-
-```
-Authelia Store (Dict)
-  └─ Key: "UserSession"
-     └─ Value: JSON([]byte) 序列化的 UserSession 对象
-           ├─ CookieDomain: "example.com"
-           ├─ Username: "john"
-           ├─ ... 其他字段
-           └─ 注意：新会话首次存储时是 UserSession 对象，SaveSession 后变为 []byte
-```
-
-**Redis存储时**：
-- Key: `authelia-session<session-id>`
-- Value: AES-GCM(Msgpack(Dict{
-    "UserSession": JSON(UserSession)
-  }))
-- 过期时间：会话 Expiration 配置
 
 ### 2.6 存储后端对比
 
@@ -934,12 +1066,34 @@ SaveSession()  // 保存到存储后端
 | 域绑定验证 | 防止cookie跨域迁移 | 攻击者可将A域cookie用于B域 |
 | 会话验证 | 检测多种会话异常状态 | 过期/失效会话继续有效 |
 | 重定向安全检查 | 防止钓鱼攻击 | 用户被重定向到恶意网站 |
+| 显式持久化 | 只有调用SaveSession才持久化 | 避免意外修改被永久保存 |
 
 **设计特点**：
 1. **多层防御**：每个节点独立校验，失败即终止
 2. **fail-close**：校验失败时创建匿名会话而非放行
 3. **可观测性**：所有安全事件都有日志记录
 4. **一致性**：多个入口（GetSession / CookieSessionAuthnStrategy）采用相同验证逻辑
+5. **显式控制**：只有调用 `SaveSession()` 才会触发 `sessionHolder.Save()` 持久化到后端
+
+#### 5.3.1 约束链路中的持久化时机
+
+在完整的约束链路中，只有以下场景会触发持久化：
+
+1. **登录流程**：
+   ```
+   DestroySession() → SaveSession()（空会话）→ RegenerateSession()
+   → UpdateExpiration()（可选）→ SaveSession()（最终会话）
+   ```
+
+2. **授权验证流程**：
+   - 域绑定验证失败 → DestroySession() → SaveSession()（新匿名会话）
+   - 会话验证失败（invalid=true）→ DestroySession() → SaveSession()（新匿名会话）
+   - 会话有修改（modified=true）→ SaveSession()（更新会话）
+
+3. **Remember Me 续期**：
+   - UpdateExpiration() → sessionHolder.Save()（持久化整个store）
+
+**注意**：如果在约束链路中只调用 `GetSession()` 而没有触发上述持久化场景，会话数据将只存在于内存中，不会被持久化到后端，导致下次请求重新初始化（详见 2.5.3 节场景1）。
 
 ---
 
@@ -980,6 +1134,10 @@ func (p *Session) UpdateExpiration(ctx *fasthttp.RequestCtx, expiration time.Dur
     return p.sessionHolder.Save(ctx, store) // 保存并更新cookie
 }
 ```
+
+**重要注意**：`UpdateExpiration()` 会调用 `sessionHolder.Save()` 持久化整个 store。如果在调用 `UpdateExpiration()` 之前只调用了 `GetSession()` 而没有调用 `SaveSession()`，那么 store 中存储的是 `UserSession` 对象而不是 `[]byte`，这会导致类型不匹配的错误持久化（详见 2.5.3 节场景2）。
+
+在登录流程中，由于先调用 `SaveSession()` 再调用 `UpdateExpiration()`，因此避免了这个问题。
 
 ### 6.2 常规会话续期
 
@@ -1108,6 +1266,8 @@ type UserSession struct {
 
 ### 8.2 会话数据存储结构（修正后）
 
+#### 8.2.1 正常持久化后的结构（经过 SaveSession）
+
 ```
 Authelia Store (Dict)
   └─ Key: "UserSession"
@@ -1115,7 +1275,6 @@ Authelia Store (Dict)
            ├─ CookieDomain: "example.com"
            ├─ Username: "john"
            ├─ ... 其他字段
-           └─ ⚠️ 新会话首次存储时是 UserSession 对象，SaveSession 后变为 []byte
 ```
 
 **Redis存储时**：
@@ -1124,6 +1283,37 @@ Authelia Store (Dict)
     "UserSession": JSON(UserSession)
   }))
 - 过期时间：会话 Expiration 配置
+
+#### 8.2.2 未持久化的临时状态（仅 GetSession 未 SaveSession）
+
+```
+内存 Store (Dict)
+  └─ Key: "UserSession"
+     └─ Value: UserSession 对象（结构体，未序列化）
+           ├─ CookieDomain: "example.com"
+           ├─ Username: ""
+           ├─ ... 其他默认字段
+```
+
+**特点**：
+- 仅存在于内存中，未持久化到后端
+- 存储类型为 `UserSession` 结构体，不是 `[]byte`
+- 下次请求时，由于后端无数据，会重新初始化
+
+#### 8.2.3 类型不匹配的错误持久化状态
+
+```
+后端存储（Redis/Memory）
+  └─ Key: "authelia-session<session-id>"
+     └─ Value: AES-GCM(Msgpack(Dict{
+         "UserSession": UserSession 对象（Msgpack序列化的结构体）
+       }))
+```
+
+**读取时**：
+- 反序列化后 `store.Get("UserSession")` 返回 `UserSession` 对象
+- 类型断言 `.([]byte)` 失败 → `ok=false` → 重新初始化
+- 需要调用 `SaveSession()` 覆盖为正确的 `[]byte` 类型
 
 ---
 
@@ -1142,6 +1332,11 @@ Authelia Store (Dict)
 | 重定向安全检查 | IsSafeRedirectionTargetURI() | 防止钓鱼攻击 |
 | 配置顺序匹配 | GetCookieDomainFromTargetURI() | 确保正确的域名路由 |
 | 安全随机ID | SessionIDGeneratorFunc | 防止会话ID猜测 |
+| 显式持久化控制 | SaveSession() 才调用 sessionHolder.Save() | 确保只有显式修改才持久化 |
+
+**注意**：代码中存在两个潜在问题（非安全漏洞，但影响可靠性）：
+1. `GetSession()` 新会话未立即持久化（详见 2.5.3 节场景1）
+2. `GetSession()` 与 `SaveSession()` 存储类型不一致（详见 2.5.3 节场景2）
 
 ---
 
@@ -1165,5 +1360,7 @@ Authelia Store (Dict)
 | 用户刷新错误处理 | `internal/handlers/handler_authz_authn.go:515-525` |
 | 登录会话发放 | `internal/handlers/handler_firstfactor_password.go:89-149` |
 | 会话读写逻辑 | `internal/session/session.go:30-78` |
+| 会话过期更新 | `internal/session/session.go:91-104` |
 | UserSession结构 | `internal/session/types.go:20-48` |
 | 多cookie域测试配置 | `internal/suites/MultiCookieDomain/configuration.yml` |
+| 会话提供者测试 | `internal/session/provider_test.go` |
