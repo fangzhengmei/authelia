@@ -455,6 +455,9 @@ func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) ([]byte, 
 | 会话提升 OTC 签发 | `internal/model/one_time_code.go` | 19-45 |
 | 会话提升 OTC 验证查询 | `internal/handlers/handler_session_elevation.go` | 270-273 |
 | 会话提升 OTC 消耗 | `internal/model/one_time_code.go` | 64-68 |
+| **OTC HMAC 签名生成** | `internal/storage/sql_provider.go` | 1019 |
+| **OTC HMAC 签名验证** | `internal/storage/sql_provider.go` | 1081-1086 |
+| **OTC HMAC 函数** | `internal/storage/sql_provider_encryption.go` | 614-622 |
 | **OIDC 授权 ACL 判定** | `internal/handlers/handler_oauth2_authorization_consent_core.go` | 35 |
 | OIDC 同意授权 ACL 检查 | `internal/handlers/handler_oauth2_consent.go` | 230, 520, 694, 767 |
 | OIDC 设备授权 ACL 检查 | `internal/handlers/handler_oauth2_device_authorization.go` | 162 |
@@ -463,6 +466,12 @@ func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) ([]byte, 
 | 未授权重定向 ACL 检查 | `internal/handlers/response.go` | 404 |
 | **Duo 2FA IP 传递** | `internal/handlers/handler_sign_duo.go` | 105 |
 | **身份验证 JWT IP 绑定** | `internal/middlewares/identity_verification.go` | 56 |
+| JWT Claims 构造（无 IP） | `internal/model/identity_verification.go` | 41-52 |
+| JWT 结构体定义（含 IssuedIP） | `internal/model/identity_verification.go` | 26-38 |
+| FindIdentityVerification（无 IP 条件） | `internal/storage/sql_provider.go` | 982-1001 |
+| SaveIdentityVerification | `internal/storage/sql_provider.go` | 953-961 |
+| ConsumeIdentityVerification | `internal/storage/sql_provider.go` | 964-970 |
+| RevokeIdentityVerification | `internal/storage/sql_provider.go` | 972-979 |
 | JWT 消耗 IP 记录 | `internal/middlewares/identity_verification.go` | 256 |
 | **邮件通知 IP 记录** | `internal/handlers/util.go` | 63 |
 | RequireElevated 中间件 | `internal/middlewares/require_auth.go` | 23-56 |
@@ -1028,73 +1037,153 @@ if err := PerformDuoAuthentication(ctx, userSession, duoAPI, device, method, rem
 
 ---
 
-#### 调用链E: 一次性代码（One-Time Code）IP 绑定
+#### 调用链E: 一次性代码（One-Time Code）IP 强校验
 
-**影响**：会话提升 OTC 的签发与消耗 IP 记录。
+**影响**：会话提升 OTC 的签发、查询与消耗。IP 在此路径中是**强校验条件**——签名中嵌入 IP，查询时必须提供相同 IP 才能命中记录。
 
 **代码链路**:
 ```
-model/one_time_code.go:39     ← 签发时记录 IssuedIP
+model/one_time_code.go:39     ← 签发时 IssuedIP = ctx.RemoteIP()
   ↓
-handler_session_elevation.go:272  ← 验证时按 IssuedIP + Username 查询
+storage/sql_provider.go:1019  ← SaveOneTimeCode: signature = HMAC(username, IssuedIP, intent, code)
   ↓
-model/one_time_code.go:67     ← 消耗时记录 ConsumedIP
+handler_session_elevation.go:272  ← LoadOneTimeCode(username, ctx.RemoteIP(), intent, rawCode)
   ↓
-handlers/handler_session_elevation.go:433  ← 撤销时记录 RevokedIP
+storage/sql_provider.go:1084  ← signature = HMAC(username, ip.IP, intent, raw)
+  ↓
+storage/sql_provider.go:1086  ← SELECT ... WHERE signature=? AND username=?
+  ↓
+model/one_time_code.go:67     ← 消耗时 ConsumedIP = ctx.RemoteIP()
 ```
 
-**关键代码** (`model/one_time_code.go:36-44`):
+**关键代码1: 签发时 IP 嵌入 HMAC 签名** (`storage/sql_provider.go:1019`):
 ```go
-return &OneTimeCode{
-    PublicID:  publicID,
-    IssuedAt:  ctx.GetClock().Now(),
-    IssuedIP:  NewIP(ctx.RemoteIP()),  // ← 签发时绑定 IP
-    ExpiresAt: ctx.GetClock().Now().Add(duration),
-    Username:  username,
-    Intent:    OTCIntentUserSessionElevation,
-    Code:      code,
-}, nil
+code.Signature = p.otcHMACSignature([]byte(code.Username), code.IssuedIP.IP, []byte(code.Intent), code.Code)
+//                              ↑ username        ↑ IssuedIP           ↑ intent          ↑ code
+// HMAC-SHA512 输出 = HMAC(key, username || IssuedIP || intent || code)
 ```
 
-**查询代码** (`handlers/handler_session_elevation.go:272`):
+**关键代码2: 验证时 IP 参与签名计算** (`storage/sql_provider.go:1081-1086`):
 ```go
-if code, err = ctx.Providers.StorageProvider.LoadOneTimeCode(
-    ctx, userSession.Username,
-    model.NewIP(ctx.RemoteIP()),  // ← 验证时必须 IP 匹配
-    model.OTCIntentUserSessionElevation, bodyJSON.OneTimeCode); err != nil {
+func (p *SQLProvider) LoadOneTimeCode(ctx context.Context, username string, ip model.IP, intent, raw string) (*model.OneTimeCode, error) {
+    code = &model.OneTimeCode{}
+    signature := p.otcHMACSignature([]byte(username), ip.IP, []byte(intent), []byte(raw))
+    //                                              ↑ 当前请求的 ctx.RemoteIP()
+    // 如果当前请求的 IP 与签发时的 IP 不同 → signature 不同 → 查不到记录 → 返回 nil
+    if err = p.db.GetContext(ctx, code, p.sqlSelectOneTimeCode, signature, username); err != nil {
+        ...
+    }
+}
 ```
+
+**IP 校验机制**：
+- OTC 的数据库主键是 `(signature, username)`，其中 `signature = HMAC(username, issued_ip, intent, code)`
+- 验证时用**当前请求的 `ctx.RemoteIP()`** 重新计算签名
+- 如果当前 IP ≠ 签发时 IP → 签名不匹配 → SQL 查询返回 0 行 → OTC 验证失败
+- **这是密码学级别的强校验**，不是简单的字符串比较
 
 **伪造 IP 的影响**：
-- 必须同时伪造 **签发时 IP + 消耗时 IP** 才能用窃取的 OTC
-- 如果攻击者在签发和消耗时伪造同一 IP → 绑定失效
-- 合法用户 IP 变化 → OTC 无法使用
+- 攻击者窃取 OTC 后，必须知道签发时的 IP 才能伪造 X-Forwarded-For 匹配签名
+- 如果攻击者不知道签发 IP，伪造的 IP 会产生不同的 HMAC 签名 → 查不到记录 → OTC 无效
+- 合法用户 IP 变化（如 Wi-Fi → 4G）→ 签名不匹配 → OTC 无法使用
 
 ---
 
-#### 调用链F: 身份验证 JWT 的 IP 绑定
+#### 调用链F: 身份验证 JWT 的 IP 纯记录（无校验）
 
 **影响**：密码重置、邮箱验证等流程的 JWT 签发与消耗。
 
 **代码链路**:
 ```
-identity_verification.go:56   ← 签发 JWT 时记录 IP
+identity_verification.go:56   ← 签发: NewIdentityVerification(jti, username, action, ctx.RemoteIP(), ...)
   ↓
-identity_verification.go:256  ← 消耗 JWT 时记录 IP
+model/identity_verification.go:14-22  ← 构造结构体: IssuedIP = ctx.RemoteIP()
   ↓
-handler_reset_password.go:125 ← 撤销 JWT 时记录 IP
+model/identity_verification.go:41-52  ← ToIdentityVerificationClaim: JWT claims 中只有 jti/action/username
+  ↓                                         ↑ 注意：IP 不在 JWT claims 中！
+identity_verification.go:82   ← SaveIdentityVerification: 写入数据库（含 IssuedIP）
+  ↓
+identity_verification.go:170-224  ← IdentityVerificationFinish:
+  ↓
+  1) jwt.ParseWithClaims: 仅验证签名、过期、issuer（无 IP 校验）
+  2) FindIdentityVerification(jti): 仅按 JTI 查询（无 IP 条件）
+  3) 检查 action 匹配 + 用户有效
+  4) ConsumeIdentityVerification(jti, consumedIP): 记录消耗 IP
 ```
 
-**关键代码** (`middlewares/identity_verification.go:56`):
+**关键代码1: JWT Claims 不包含 IP** (`model/identity_verification.go:41-52`):
 ```go
-verification := model.NewIdentityVerification(
-    jti, identity.Username, args.ActionClaim,
-    ctx.RemoteIP(),  // ← 签发时记录 IP
-    ctx.Configuration.IdentityValidation.ResetPassword.JWTExpiration)
+func (v IdentityVerification) ToIdentityVerificationClaim(issuer *url.URL) *IdentityVerificationClaim {
+    return &IdentityVerificationClaim{
+        RegisteredClaims: jwt.RegisteredClaims{
+            ID:        v.JTI.String(),    // JTI
+            Issuer:    issuer.String(),   // issuer
+            IssuedAt:  jwt.NewNumericDate(v.IssuedAt),
+            ExpiresAt: jwt.NewNumericDate(v.ExpiresAt),
+        },
+        Action:   v.Action,              // action
+        Username: v.Username,            // username
+        // ⚠️ 没有 IP 字段！IssuedIP 只存在数据库行中，不出现在 JWT token 中
+    }
+}
 ```
+
+**关键代码2: FindIdentityVerification 只按 JTI 查询** (`storage/sql_provider.go:982-1001`):
+```go
+func (p *SQLProvider) FindIdentityVerification(ctx context.Context, jti string) (found bool, err error) {
+    verification := model.IdentityVerification{}
+    if err = p.db.GetContext(ctx, &verification, p.sqlSelectIdentityVerification, jti); err != nil {
+        // 查询条件只有 jti，没有 issued_ip 条件
+        ...
+    }
+    switch {
+    case verification.RevokedAt.Valid:   // 检查是否已撤销
+        return false, fmt.Errorf("the token has been revoked")
+    case verification.ConsumedAt.Valid:  // 检查是否已消耗
+        return false, fmt.Errorf("the token has already been consumed")
+    case verification.ExpiresAt.Before(time.Now()):  // 检查是否过期
+        return false, fmt.Errorf("the token expired %s ago", ...)
+    default:
+        return true, nil   // ⚠️ 通过！没有检查 issued_ip 是否匹配当前请求 IP
+    }
+}
+```
+
+**关键代码3: ConsumeIdentityVerification 只记录 IP** (`storage/sql_provider.go:964-970`):
+```go
+func (p *SQLProvider) ConsumeIdentityVerification(ctx context.Context, jti string, ip model.NullIP) error {
+    // UPDATE SET consumed=NOW(), consumed_ip=? WHERE jti=?
+    // ip 只是写入 consumed_ip 字段，不参与 WHERE 条件
+    if _, err = p.db.ExecContext(ctx, p.sqlConsumeIdentityVerification, time.Now(), ip, jti); err != nil {
+        return fmt.Errorf("error updating identity verification: %w", err)
+    }
+    return nil
+}
+```
+
+**IP 机制结论**：
+- `IssuedIP` 是**纯记录字段**，写入数据库但**不参与任何查询条件或校验逻辑**
+- JWT token 中**不含 IP 信息**，验证时只检查签名、过期、action、用户有效性
+- `ConsumedIP`/`RevokedIP` 也是纯记录字段，仅用于审计追溯
+- **任何持有有效 JWT token 的人都可以消耗它**，不受 IP 变化影响
 
 **伪造 IP 的影响**：
-- 与 OTC 类似，签发和消耗 IP 必须匹配（由业务逻辑校验）
-- 伪造 IP 可绕过 IP 绑定保护
+- 伪造 IP **不会绕过任何安全校验**，因为 IP 本身就不参与校验
+- 伪造 IP 只影响审计记录：数据库中 `issued_ip`、`consumed_ip`、`revoked_ip` 字段被写入伪造值
+- 攻击者窃取 JWT token 后可在任何 IP 使用，这是**设计意图**（密码重置邮件的链接应可在任何设备打开）
+
+---
+
+#### OTC vs JWT IP 机制对比
+
+| 维度 | OTC（调用链E） | JWT（调用链F） |
+|------|---------------|---------------|
+| **IP 在签名中的角色** | `HMAC(username, issuedIP, intent, code)` — IP 参与签名 | JWT claims 无 IP — IP 不参与签名 |
+| **验证时的 IP 检查** | 必须用当前 IP 重算 HMAC 签名，签名不匹配则查不到记录 | 仅按 JTI 查询数据库，无 IP 条件 |
+| **IP 变化后** | 签名不匹配 → OTC 失效 → 用户必须重新签发 | 不影响 → JWT 在任何 IP 都有效 |
+| **IP 是记录还是校验** | **强校验** — 密码学级别 HMAC 绑定 | **纯记录** — 仅写入数据库供审计 |
+| **伪造 IP 可绕过** | ❌ 不可能（除非知道签发时 IP 并伪造相同值） | ✅ 无需绕过（IP 不参与校验） |
+| **设计意图** | 防止 OTC 被窃取后跨 IP 使用 | 允许用户在任何设备通过邮件链接重置密码 |
 
 ---
 
@@ -1121,15 +1210,15 @@ mailOpts := session.SendLoginEventNotificationOptions{
 
 #### 非 forward-auth 调用链汇总表
 
-| 调用链 | 代码位置 | 伪造 IP 的后果 | 故障排除特征 |
-|--------|---------|--------------|-------------|
-| **会话提升 IP 绑定** | `require_auth.go:115` | 高权限操作可被伪造 IP 执行 | 日志出现 "session elevation did not have a matching IP" |
-| **OIDC 授权 ACL** | `handler_oauth2_consent.go` | ACL networks 规则被绕过 | OIDC 应用的 2FA 要求失效 |
-| **1FA/2FA 重定向策略** | `response.go:51` | 重定向 URL 安全校验被绕过 | 登录后跳转异常 |
-| **Duo 2FA IP 传递** | `handler_sign_duo.go:105` | Duo 风控绕过，审计失效 | Duo 后台登录 IP 异常 |
-| **OTC IP 绑定** | `one_time_code.go:39` | 会话提升 OTC IP 绑定失效 | OTC 验证失败，IP 不匹配 |
-| **身份验证 JWT** | `identity_verification.go:56` | 密码重置 IP 绑定失效 | 密码重置邮件 IP 异常 |
-| **邮件通知 IP** | `util.go:63` | 安全通知邮件显示伪造 IP | 用户投诉登录通知 IP 不对 |
+| 调用链 | 代码位置 | IP 机制 | 伪造 IP 的后果 | 故障排除特征 |
+|--------|---------|--------|--------------|-------------|
+| **会话提升 IP 绑定** | `require_auth.go:115` | 强校验（`Equal`） | 高权限操作可被伪造 IP 执行 | 日志出现 "session elevation did not have a matching IP" |
+| **OIDC 授权 ACL** | `handler_oauth2_consent.go` | 强校验（ACL 匹配） | ACL networks 规则被绕过 | OIDC 应用的 2FA 要求失效 |
+| **1FA/2FA 重定向策略** | `response.go:51` | 强校验（ACL 匹配） | 重定向 URL 安全校验被绕过 | 登录后跳转异常 |
+| **Duo 2FA IP 传递** | `handler_sign_duo.go:105` | 纯传递（无校验） | Duo 风控绕过，审计失效 | Duo 后台登录 IP 异常 |
+| **OTC IP 绑定** | `storage/sql_provider.go:1019` | **强校验（HMAC 签名）** | 不知道签发 IP 则 OTC 无法使用 | 用户反馈"验证码无效"，日志无匹配记录 |
+| **身份验证 JWT** | `identity_verification.go:56` | **纯记录（无校验）** | 无安全影响，仅审计记录被污染 | 数据库 `issued_ip`/`consumed_ip` 为伪造值 |
+| **邮件通知 IP** | `util.go:63` | 纯记录（无校验） | 安全通知邮件显示伪造 IP | 用户投诉登录通知 IP 不对 |
 
 ### 10.8 分层风险影响与故障排除指南
 
@@ -1139,22 +1228,29 @@ mailOpts := session.SendLoginEventNotificationOptions{
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  L3: 身份伪造层 (High)                                  │
+│  L3: 身份伪造层 (High) — IP 参与强校验，伪造可绕过       │
 │  ACL 规则绕过 → 直接获取未授权资源访问权限               │
 │  OIDC 授权 ACL 绕过 → 绕过 2FA 要求                     │
+│  1FA/2FA 重定向策略绕过 → 降低认证级别要求               │
+│  会话提升 IP 绑定绕过 → 高权限操作防护失效               │
+│  OTC HMAC 签名绕过 → 窃取的 OTC 可跨 IP 使用            │
 ├─────────────────────────────────────────────────────────┤
-│  L2: 防御绕过层 (Medium)                                │
+│  L2: 防御绕过层 (Medium) — IP 参与速率/封禁计算          │
 │  Regulation 封禁绕过 → 暴力破解防护失效                  │
 │  速率限制绕过 → 接口滥用防护失效                         │
-│  会话提升 IP 绑定绕过 → 高权限操作防护失效               │
-│  OTC/JWT IP 绑定绕过 → 令牌保护失效                     │
 ├─────────────────────────────────────────────────────────┤
-│  L1: 日志与审计层 (Low)                                 │
+│  L1: 日志与审计层 (Low) — IP 仅做记录，无校验逻辑        │
 │  日志污染 → 攻击溯源失效                                 │
 │  邮件通知 IP 伪造 → 用户误导                             │
 │  Duo IP 伪造 → 第三方风控失效                           │
+│  JWT issued_ip/consumed_ip 伪造 → 审计记录失真          │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**重要修正**：此前将 JWT IP 绑定归入 L2 防御绕过层是**错误的**。经过代码审查：
+- JWT 的 `issued_ip` 是**纯记录字段**，不参与任何校验逻辑，属于 L1 审计层
+- OTC 的 `issued_ip` 参与 HMAC 签名计算，是**强校验条件**，属于 L3 身份伪造层
+- 两者的安全语义完全不同，不能等同对待
 
 #### 各层故障排除步骤
 
@@ -1200,6 +1296,78 @@ mailOpts := session.SendLoginEventNotificationOptions{
    # 查看 Authelia 日志中的 remote_ip 是否匹配你的公网 IP
    ```
 
+#### IP 绑定机制专项排查步骤
+
+当用户反馈"验证码无效"或"操作被拒绝"时，按以下步骤判断是否为 X-Forwarded-For 伪造导致 IP 不一致：
+
+**步骤1: 判断是 OTC 还是 JWT 流程**
+
+| 场景 | 流程 | IP 校验 |
+|------|------|--------|
+| 会话提升验证码（6位字母） | OTC | **强校验** — HMAC 签名含 IP |
+| 密码重置邮件链接 | JWT | **无校验** — IP 仅记录 |
+| 添加/注册设备邮件链接 | JWT | **无校验** — IP 仅记录 |
+
+**步骤2: OTC 失效排查（强校验场景）**
+
+```
+用户反馈: "输入了正确的会话提升验证码，但提示无效"
+     │
+     ├─→ 检查用户当前 IP 是否与签发 OTC 时的 IP 一致
+     │    ├─ Authelia 日志中找 "creating user session elevation One-Time Code"
+     │    │  记录的 remote_ip = 签发时 IP
+     │    ├─ 同一用户后续请求的 remote_ip = 验证时 IP
+     │    └─ 如果两者不同 → OTC 签名不匹配 → 这就是根因
+     │
+     ├─→ 检查 X-Forwarded-For 是否被代理正确处理
+     │    ├─ 签发和验证请求是否走了不同的代理路径？
+     │    ├─ 某次请求是否被 CDN 调度到不同节点（IP 变化）？
+     │    └─ 代理是否在某些请求中未传递 X-Forwarded-For？
+     │
+     └─→ 快速验证
+          # 在 Authelia 日志中搜索
+          grep "One-Time Code" authelia.log | grep "<username>"
+          # 比较签发和验证时的 remote_ip
+```
+
+**步骤3: JWT 密码重置排查（无校验场景）**
+
+```
+用户反馈: "密码重置链接无法使用"
+     │
+     ├─→ JWT 不受 IP 影响，排除 IP 伪造问题
+     │
+     ├─→ 检查 JWT 本身的有效性
+     │    ├─ token 是否过期？（检查 exp claim）
+     │    ├─ token 是否已被消耗/撤销？（检查数据库 consumed/revoked 字段）
+     │    ├─ action 是否匹配？（ResetPassword vs 其他）
+     │    └─ JWT 签名是否正确？（检查 JWTSecret 配置）
+     │
+     └─→ 如果 JWT 正常但数据库 issued_ip 异常
+          ├─ 这是 X-Forwarded-For 伪造的**症状**，不是**原因**
+          ├─ 伪造 IP 不影响 JWT 消耗，但表明代理配置有问题
+          └─ 需要修复代理配置，防止后续 OTC 等强校验流程出问题
+```
+
+**步骤4: 会话提升 IP 绑定排查**
+
+```
+用户反馈: "操作超时"或"需要重新验证"
+     │
+     ├─→ Authelia 日志搜索
+     │    grep "session elevation did not have a matching IP" authelia.log
+     │
+     ├─→ 如果出现此日志 → IP 绑定校验失败
+     │    ├─ 用户确实切换了网络 → 正常行为
+     │    └─ 用户未切换网络但 IP 变化 → 代理配置问题
+     │         ├─ CDN 节点切换导致出口 IP 变化
+     │         └─ 代理 trustedIPs 配置遗漏
+     │
+     └─→ 临时缓解（非推荐）
+          调整 identity_validation.elevated_session.expires 延长有效期
+          但这会降低安全性，应优先修复代理配置
+```
+
 #### 故障排除决策树
 
 ```
@@ -1236,10 +1404,10 @@ mailOpts := session.SendLoginEventNotificationOptions{
 3. **URL 拼接安全**：`getRequestURIFromForwardedHeaders` 使用 `url.ParseRequestURI` 解析，能防止大部分 URL 伪造攻击
 4. **Session-Username 头校验**：Cookie 认证时会检查 `Session-Username` 请求头与会话用户名是否一致，防止 Cookie 劫持
 5. **HTTPS 强制**：目标 URL 必须是 `https` 或 `wss` 协议，确保 Session Cookie 安全传输
-6. **X-Forwarded-For 影响 11 个独立子系统**：
-   - **L3 身份伪造层**：ACL 网络规则、OIDC 授权 ACL、1FA/2FA 重定向策略
-   - **L2 防御绕过层**：Regulation IP 封禁、IP 速率限制、会话提升 IP 绑定、OTC IP 绑定、JWT IP 绑定
-   - **L1 日志审计层**：日志记录、邮件通知 IP、Duo 2FA 风控 IP
+6. **X-Forwarded-For 影响的子系统按 IP 校验强度分类**：
+   - **L3 强校验层（IP 参与校验，伪造可绕过）**：ACL 网络规则、OIDC 授权 ACL、1FA/2FA 重定向策略、会话提升 IP 绑定、OTC HMAC 签名
+   - **L2 计算层（IP 参与速率/封禁计算）**：Regulation IP 封禁、IP 速率限制
+   - **L1 记录层（IP 仅做记录，无校验）**：日志记录、邮件通知 IP、Duo 2FA 风控 IP、JWT issued_ip/consumed_ip
 7. **XFF 伪造的杀伤力不取决于 ACL 配置**：即使未使用 `networks` 规则，L2 层的 Regulation 封禁、速率限制、会话提升保护始终受影响
 8. **Caddy trusted_proxies 位置易错**：`trusted_proxies` 是站点/全局级别指令，**不能**配置在 `forward_auth` 块内部
 9. **多层代理必须完整配置 trustedIPs**：遗漏 CDN 节点 IP 不会导致身份伪造，但会导致所有依赖真实客户端 IP 的功能全面降级（ACL 误拒、封禁失效、审计丢失）
