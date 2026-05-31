@@ -479,7 +479,73 @@ type AuthenticationAttempt struct {
 
 ## 六、登录历史查看与敏感信息二次确认
 
-### 6.1 WebAuthn 凭证详情查看流程
+### 6.0 代码勘误：登录历史API缺失证据
+
+> **⚠️ 重要勘误**：Authelia设置模块中**没有独立的登录历史页面或API**。
+
+**路由缺失证据** (`internal/server/handlers.go`):
+- 全文搜索 `/api/.*login.*history` 或 `/api/.*authentication.*log` 无匹配
+- 无 `/api/user/login-history` 或类似独立API端点
+- 无 `handler_login_history.go` 或类似处理器文件
+
+**页面缺失证据** (`web/src/views/Settings/`):
+- 无 `LoginHistoryPanel.tsx` 或类似页面组件
+- 设置页仅包含 `SecurityView`（修改密码）和 `TwoFactorAuthenticationView`（2FA管理）
+
+**替代分析边界**：
+本文档中的"登录历史查看"分析**仅限**于以下间接功能：
+1. TOTP配置信息中的 `last_used_at` 字段（通过 `/api/secondfactor/totp` GET获取）
+2. WebAuthn凭证信息中的 `last_used_at` 字段（通过 `/api/secondfactor/webauthn/credentials` GET获取）
+3. 内部 `authentication_logs` 表仅用于监管（封禁检测），**不对外暴露API**
+
+---
+
+### 6.1 TOTP与WebAuthn查看最近使用信息的二次确认差异
+
+**TOTP 查看流程** (`web/src/views/Settings/TwoFactorAuthentication/OneTimePasswordPanel.tsx:158-160`):
+```typescript
+const handleInformation = () => {
+    setDialogInformationOpen(true);  // 直接打开，无二次确认
+};
+```
+
+**WebAuthn 查看流程** (`web/src/views/Settings/TwoFactorAuthentication/WebAuthnCredentialsPanel.tsx:188-195`):
+```typescript
+const handleInformation = (index: number) => {
+    if (!props.credentials) return;
+    if (props.credentials.length + 1 < index) return;
+    
+    setIndexInformation(index);
+    setDialogInformationOpen(true);  // 直接打开，无二次确认
+};
+```
+
+**共同点**：
+- 两者的"查看"操作**都不需要二次确认**
+- 只有"编辑"和"删除"操作才需要会话提升（二次确认）
+
+**差异对比表**：
+
+| 特性 | TOTP | WebAuthn |
+|------|------|----------|
+| 查看操作二次确认 | ❌ 不需要 | ❌ 不需要 |
+| 编辑操作 | N/A（无编辑功能） | ✅ 需要二次确认 |
+| 删除操作 | ✅ 需要二次确认 | ✅ 需要二次确认 |
+| 最近使用信息 | `last_used_at`（单个时间点） | `last_used_at` + `sign_count`（使用次数） |
+| 信息详细程度 | 算法、位数、周期、发行者、添加时间、最后使用 | 描述、RPID、AAGUID、 attestation类型、附件、可发现、用户验证、备份状态、传输方式、克隆警告、使用次数、添加时间、最后使用 |
+
+**TOTP信息对话框内容** (`web/src/views/Settings/TwoFactorAuthentication/OneTimePasswordInformationDialog.tsx:70-80`):
+```typescript
+<PropertyText name={translate("Last Used")} value={
+    props.config.last_used_at
+        ? translate("{{when, datetime}}", { when: new Date(props.config.last_used_at) })
+        : translate("Never")
+} />
+```
+
+---
+
+### 6.2 WebAuthn 凭证详情查看流程
 
 **前端触发点** (`web/src/views/Settings/TwoFactorAuthentication/WebAuthnCredentialsPanel.tsx:188-195`):
 ```typescript
@@ -494,7 +560,7 @@ const handleInformation = (index: number) => {
 
 **⚠️ 关键发现**: WebAuthn凭证详情查看（包含登录历史中的 `last_used_at`、`sign_count` 等敏感信息）**不需要**会话提升（二次确认），而编辑、删除操作才需要。
 
-### 6.2 凭证详情展示内容
+### 6.3 凭证详情展示内容
 
 **展示数据** (`web/src/views/Settings/TwoFactorAuthentication/WebAuthnCredentialInformationDialog.tsx:1-189`):
 ```
@@ -523,7 +589,7 @@ const handleInformation = (index: number) => {
 - **权限**: `middleware1FA` (仅需1FA认证，**无需**会话提升)
 - **返回**: 完整的 `[]model.WebAuthnCredential` 数组，包含 `last_used_at`
 
-### 6.3 登录历史（认证日志）的二次确认场景
+### 6.4 登录历史（认证日志）的二次确认场景
 
 虽然查看WebAuthn凭证详情不需要二次确认，但以下场景**需要**会话提升：
 
@@ -534,7 +600,7 @@ const handleInformation = (index: number) => {
 | **注册**新凭证 | `handleRegister()` → `handleElevation()` | Elevated 1FA |
 | **查看**凭证详情 | `handleInformation()` → 直接打开 | 1FA Only |
 
-### 6.4 二次确认完整流程（以编辑凭证为例）
+### 6.5 二次确认完整流程（以编辑凭证为例）
 
 ```
 前端 (WebAuthnCredentialsPanel)
@@ -807,18 +873,98 @@ if modified {
 }
 ```
 
-### 8.3 回写失败策略
+### 8.3 回写失败策略（代码勘误版）
 
-不同场景对回写失败的处理策略不同：
+> **⚠️ 重要勘误**：之前的分析有误。实际代码中回写失败**没有返回500的场景**，全部是返回403/401/400或仅记录日志。
 
-| 场景 | 回写失败处理 | 影响 |
-|-----|-------------|------|
-| **会话提升过期清理** | 返回500错误 | 用户无法获取提升状态，需重新验证 |
-| **会话提升成功** | 返回500错误 | 验证成功但会话未保存，需重试 |
-| **用户信息刷新** | 返回500错误 | 请求失败，但Session实际已更新 |
-| **WebAuthn验证后清理** | 仅记录日志，继续返回成功 | 临时数据可能残留，下次请求被清理 |
-| **TOTP注册完成** | 返回500错误 | 注册成功但会话未清理，可能导致重复注册 |
-| **LastActivity更新** | 静默失败 | 活动时间未更新，可能导致提前超时 |
+**实际返回行为分类**：
+
+#### 🔴 返回 403 Forbidden 的场景（共4处）
+
+| 场景 | 代码位置 | 操作是否已执行 |
+|-----|---------|--------------|
+| **会话提升GET - 过期/IP不匹配清理后** | `handler_session_elevation.go:98-105` | ❌ 未执行（只是清除） |
+| **会话提升PUT - 验证成功后** | `handler_session_elevation.go:352-359` | ✅ OTC已消费 |
+| **WebAuthn断言GET - 生成挑战后** | `handler_sign_webauthn.go:107-114` | ❌ 未开始验证 |
+| **TOTP验证POST - 验证成功后** | `handler_sign_totp.go:197-204` | ✅ 验证已通过 |
+
+**代码示例** (`handler_session_elevation.go:98-105`):
+```go
+if err = ctx.SaveSession(userSession); err != nil {
+    ctx.Logger.WithError(err).Error("Error occurred retrieving the user session elevation state...")
+    ctx.SetJSONError(messageOperationFailed)
+    ctx.SetStatusCode(fasthttp.StatusForbidden)  // 403，不是500
+    return
+}
+```
+
+#### 🟠 返回 401 Unauthorized 的场景（共1处）
+
+| 场景 | 代码位置 | 操作是否已执行 |
+|-----|---------|--------------|
+| **密码验证POST - 验证成功后** | `handler_sign_password.go:87-93` | ✅ 验证已通过 |
+
+**代码示例** (`handler_sign_password.go:87-93`):
+```go
+if err = ctx.SaveSession(userSession); err != nil {
+    ctx.Logger.WithError(err).Errorf("Error occurred saving session...")
+    respondUnauthorized(ctx, messageAuthenticationFailed)  // 401
+    return
+}
+```
+
+#### 🟡 返回 400 Bad Request 的场景（共2处）
+
+| 场景 | 代码位置 | 操作是否已执行 |
+|-----|---------|--------------|
+| **会话提升PUT - 请求体解析失败** | `handler_session_elevation.go:252-259` | ❌ 未开始验证 |
+| **会话提升PUT - OTC长度>20** | `handler_session_elevation.go:263-270` | ❌ 未开始验证 |
+
+**代码示例** (`handler_session_elevation.go:252-259`):
+```go
+if err = ctx.ParseBody(&bodyJSON); err != nil {
+    ctx.Logger.WithError(err).Errorf("Error occurred parsing body...")
+    ctx.SetStatusCode(fasthttp.StatusBadRequest)  // 400
+    ctx.SetJSONError(messageOperationFailed)
+    return
+}
+```
+
+#### 🟢 仅记录日志不返回错误的场景（共2处）
+
+| 场景 | 代码位置 | 操作是否已执行 |
+|-----|---------|--------------|
+| **WebAuthn断言POST - defer清理临时数据** | `handler_sign_webauthn.go:215-221` | ✅ 验证已通过 |
+| **重置密码DELETE - 清除密码重置标记** | `handler_reset_password.go:283-285` | ✅ 已清除标记 |
+
+**代码示例** (`handler_sign_webauthn.go:215-221`):
+```go
+defer func() {
+    userSession.WebAuthn = nil
+    if err = ctx.SaveSession(userSession); err != nil {
+        // ⚠️ 仅记录日志，不返回错误
+        // 即使回写失败，验证仍然被视为成功
+        ctx.Logger.WithError(err).Errorf("Error occurred validating a WebAuthn...")
+    }
+}()
+```
+
+---
+
+**修正后的回写失败影响矩阵**：
+
+| 回写场景 | 回写失败时操作是否已执行 | 实际返回状态码 | 状态一致性风险 |
+|---------|------------------------|--------------|--------------|
+| 会话提升过期清理 | ❌ 未执行（只是清除） | 403 | 低 - 下次请求重新清理 |
+| 会话提升成功 | ✅ OTC已消费 | 403 | 中 - 需重新生成OTC |
+| WebAuthn挑战生成 | ❌ 验证未开始 | 403 | 低 - 重新获取挑战 |
+| WebAuthn验证清理（defer） | ✅ 验证已通过 | 200（仅日志） | 低 - 下次请求清理 |
+| TOTP验证成功 | ✅ 验证已通过 | 403 | **高** - 实际已认证但返回失败 |
+| 密码验证成功 | ✅ 验证已通过 | 401 | **高** - 实际已认证但返回失败 |
+| 用户信息刷新 | ✅ Session内存已更新 | 200（中间件处理） | 高 - Cookie与内存不一致 |
+| TOTP注册清理 | ✅ 已写入Storage | 403 | 中 - 可能重复注册 |
+| LastActivity更新 | ❌ 仅更新时间戳 | 静默失败 | 低 - 可能提前超时 |
+| 2FA认证成功 | ✅ 认证已通过 | 403 | **高** - 实际已认证但返回失败 |
 
 ---
 
@@ -994,11 +1140,11 @@ try {
     └─► 正常 → 返回 Elevated = true
 ```
 
-**失败回退策略**:
+**失败回退策略**（代码勘误版）:
 - 会话获取失败 → 返回 403 Forbidden
 - 提升会话过期/IP不匹配 → 清除后尝试回写Session
   - 回写成功 → 返回正常响应（elevated=false）
-  - 回写失败 → 返回 500 错误
+  - 回写失败 → 返回 **403 Forbidden**（不是500）
 
 ### 12.2 会话提升PUT（OTC验证）关键分支
 
@@ -1202,14 +1348,34 @@ Regulator.HandleAttempt(successful, banned, ...)
     └─► Session有修改 → SaveSession() 回写
 ```
 
-### 13.3 回写失败影响矩阵
+### 13.3 回写失败影响矩阵（代码勘误版）
 
-| 回写场景 | 回写失败时操作是否已执行 | 状态一致性风险 |
-|---------|------------------------|--------------|
-| 会话提升过期清理 | ❌ 未执行（只是清除） | 低 - 下次请求重新清理 |
-| 会话提升成功 | ✅ OTC已消费 | 中 - 需重新生成OTC |
-| 用户信息刷新 | ✅ Session内存已更新 | 高 - Cookie与内存不一致 |
-| WebAuthn验证清理 | ✅ 验证已通过 | 低 - defer重试清理 |
-| TOTP注册清理 | ✅ 已写入Storage | 中 - 可能重复注册 |
-| LastActivity更新 | ❌ 仅更新时间戳 | 低 - 可能提前超时 |
-| 2FA认证成功 | ✅ 认证已通过 | 中 - 需重新认证 |
+> **⚠️ 重要勘误**：此矩阵已根据实际代码行为修正，之前版本中"返回500"的描述均为错误。
+
+| 回写场景 | 回写失败时操作是否已执行 | 实际返回状态码 | 状态一致性风险 |
+|---------|------------------------|--------------|--------------|
+| 会话提升过期清理 | ❌ 未执行（只是清除） | 403 | 低 - 下次请求重新清理 |
+| 会话提升成功 | ✅ OTC已消费 | 403 | 中 - 需重新生成OTC |
+| WebAuthn挑战生成 | ❌ 验证未开始 | 403 | 低 - 重新获取挑战 |
+| WebAuthn验证清理（defer） | ✅ 验证已通过 | 200（仅日志） | 低 - 下次请求清理 |
+| TOTP验证成功 | ✅ 验证已通过 | 403 | **高** - 实际已认证但返回失败 |
+| 密码验证成功 | ✅ 验证已通过 | 401 | **高** - 实际已认证但返回失败 |
+| 用户信息刷新 | ✅ Session内存已更新 | 200（中间件处理） | 高 - Cookie与内存不一致 |
+| TOTP注册清理 | ✅ 已写入Storage | 403 | 中 - 可能重复注册 |
+| LastActivity更新 | ❌ 仅更新时间戳 | 静默失败 | 低 - 可能提前超时 |
+| 2FA认证成功 | ✅ 认证已通过 | 403 | **高** - 实际已认证但返回失败 |
+
+---
+
+### 13.4 回写失败处理策略总结
+
+**核心原则**：回写失败的处理策略取决于**操作是否已产生不可逆影响**：
+
+1. **操作未执行**（如会话提升过期清理、WebAuthn挑战生成）→ 返回403，让用户重试
+2. **操作已执行但可重试**（如会话提升成功、OTC已消费）→ 返回403，提示用户重新验证
+3. **操作已执行且不可重试**（如WebAuthn验证通过、密码验证通过）→ 仅记录日志，返回成功，避免用户困惑
+4. **非关键操作**（如LastActivity更新）→ 静默失败，不影响主流程
+
+**高风险场景警示**：
+- TOTP/密码/2FA验证成功但SaveSession失败时，用户实际已认证但收到失败响应，可能导致重复验证
+- 建议在前端增加重试逻辑，或在后端优化SaveSession失败时的状态一致性保障
