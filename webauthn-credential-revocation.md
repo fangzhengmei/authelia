@@ -213,68 +213,468 @@ handleGetWebAuthnUserByRPID(ctx, username, displayname, rpid)
 
 **代码位置**：`internal/handlers/handler_sign_webauthn.go:129-283`
 
+**关键修正：UpdateSignInInfo 实际更新范围**
+
+```go
+// internal/model/webauthn.go:162-178
+func (c *WebAuthnCredential) UpdateSignInInfo(config *webauthn.Config, now time.Time, credential *webauthn.Credential) {
+    c.LastUsedAt = sql.NullTime{Time: now, Valid: true}
+    c.SignCount, c.CloneWarning = credential.Authenticator.SignCount, credential.Authenticator.CloneWarning
+
+    c.UpdateAttestationType(credential)  // 仅当 AttestationType 为空时才更新
+
+    if c.RPID != "" || config == nil {
+        return  // ← 直接 return，后续 RPID 设置仅对遗留凭据生效
+    }
+
+    // RPID 设置（仅对 RPID 为空的老凭据执行）
+    switch c.AttestationType {
+    case attestationTypeFIDOU2F:
+        c.RPID = config.RPOrigins[0]
+    default:
+        c.RPID = config.RPID
+    }
+}
 ```
-handleGetWebAuthnUserByRPID(ctx, username, displayname, rpid)
-    │ → 再次从数据库加载凭据（实时读取，不使用缓存）
-    │ → 如果凭据已删除，user.Credentials 为空或不包含已删凭据
-    │
-    ↓
+
+**UpdateSignInInfo 实际只更新以下字段**：
+| 字段 | 是否更新 | 备注 |
+|------|---------|------|
+| `LastUsedAt` | ✅ 是 | 登录时间戳 |
+| `SignCount` | ✅ 是 | 签名计数器，用于克隆检测 |
+| `CloneWarning` | ✅ 是 | 克隆警告标志 |
+| `AttestationType` | ⚠️ 条件 | 仅当数据库中为空时更新 |
+| `RPID` | ⚠️ 条件 | 仅当数据库中为空时更新 |
+| `Discoverable` | ❌ 否 | **不更新**，保持数据库原值 |
+| `Present` | ❌ 否 | **不更新**，保持数据库原值 |
+| `Verified` | ❌ 否 | **不更新**，保持数据库原值 |
+| `BackupEligible` | ❌ 否 | **不更新**，保持数据库原值 |
+| `BackupState` | ❌ 否 | **不更新**，保持数据库原值 |
+
+> **重要**：尽管 `UpdateWebAuthnCredentialSignIn` 的 SQL UPDATE 语句包含所有这些字段（`internal/storage/sql_provider_queries.go:209-214`），但由于 `UpdateSignInInfo` 不修改后五个字段，数据库中会写回 SELECT 时的原值。
+
+**2FA 断言成功后的写回逻辑**：
+```
 w.ValidateLogin(user, sessionData, response)
-    │ → go-webauthn 库使用 user.WebAuthnCredentials() 返回的公钥列表
-    │ → 内部遍历公钥列表，找到 KID 匹配的公钥进行签名验证
-    │ → 如果 KID 不在列表中 → 返回错误（凭据未找到）
+    │ → go-webauthn 库验证签名
+    │ → 如果 KID 不在 user.Credentials 中 → 返回错误
     │
     ↓  验证成功后：
 for _, credential := range user.Credentials {
     if bytes.Equal(credential.KID.Bytes(), c.ID) {
         credential.UpdateSignInInfo(w.Config, now, c)
-            │ (internal/model/webauthn.go:162-178)
-            │ 更新以下字段：
-            │   LastUsedAt   = now
-            │   SignCount    = c.Authenticator.SignCount
-            │   CloneWarning = c.Authenticator.CloneWarning
-            │   Present      = c.Flags.UserPresent        ← 认证器实时报告
-            │   Verified     = c.Flags.UserVerified       ← 认证器实时报告
-            │   BackupEligible = c.Flags.BackupEligible   ← 认证器实时报告
-            │   BackupState    = c.Flags.BackupState      ← 认证器实时报告
-            │   Discoverable   = 不变（保留数据库原值）
+            │ → 仅更新 LastUsedAt、SignCount、CloneWarning
+            │ → Present/Verified/BackupEligible/BackupState/Discoverable 保持不变
             │
         UpdateWebAuthnCredentialSignIn(ctx, credential)
-            │ (internal/storage/sql_provider.go:763-771)
-            │ SQL: UPDATE webauthn_credentials
-            │      SET rpid=?, last_used_at=?, attestation_type=?, sign_count=?,
-            │          discoverable=?, present=?, verified=?,
-            │          backup_eligible=?, backup_state=?,
-            │          clone_warning = CASE clone_warning WHEN TRUE THEN TRUE ELSE ? END
-            │      WHERE id = ?
+            │ → SQL UPDATE 写回所有字段，但上述字段为原值
     }
-}
-
-if !found {
-    → HTTP 403 + "Authentication failed, please retry later."
 }
 ```
 
 **backup_eligible / backup_state 在断言校验拒绝中的角色**：
 
-这两个标志位**不参与拒绝判定**。它们的唯一用途是：
-1. 在 `UpdateSignInInfo` 中随每次成功登录被认证器最新值覆盖
-2. 在 `VerifyCredential`（MDS 元数据验证，`internal/webauthn/credential.go:35-37`）中，如果管理员配置了 `ProhibitBackupEligibility`，**且该凭据已经存在于数据库中**，会在 CLI `storage user webauthn list` 时标记为 `IsProhibitedBackupEligibility`——但这不影响断言校验本身
+这两个标志位**完全不参与 2FA 断言的拒绝判定**。它们的唯一用途是：
+1. 注册时写入数据库，记录认证器硬件能力
+2. 在 `VerifyCredential`（MDS 元数据验证 CLI）中标记违反策略的凭据（如 `ProhibitBackupEligibility`）
+3. **不影响任何登录验证流程**
 
-**discoverable 在断言阶段的影响**：
-- `UpdateWebAuthnCredentialSignIn` 会将 `discoverable` 值写回数据库（`internal/storage/sql_provider_queries.go:209-214`），但实际上 `UpdateSignInInfo` 不修改 `Discoverable` 字段（保持数据库原值）
-- 在 Passkey 免用户名登录场景（`handlerWebAuthnDiscoverableLogin`，`internal/handlers/webauthn.go:48-69`）中，`discoverable` 用于过滤凭据：
-  ```sql
-  -- LoadWebAuthnPasskeyCredentialsByUsername
-  WHERE rpid = ? AND username = ? AND (? = FALSE OR discoverable = TRUE)
-  ```
-  传入第三参数为 `TRUE` → 只返回 `discoverable=TRUE` 的凭据
+**discoverable 在 2FA 断言阶段的影响**：
+- 2FA 断言加载凭据时不按 discoverable 过滤（第三参数为 FALSE），所有凭据都返回
+- `UpdateSignInInfo` 不修改 Discoverable 字段
+- 只有在 Passkey 第一因子登录时才会触发 discoverable 的被动升级（见第 5 章）
 
 ---
 
-## 3. 管理员执行 `storage user webauthn delete` 后 assertion 拒绝的完整分支
+## 3. 凭据撤销方式
 
-### 3.1 删除操作执行
+### 3.1 用户主动删除（Web UI）
+
+#### API 端点
+- **路由**：`DELETE /api/secondfactor/webauthn/credential/{credentialID}`
+- **中间件**：`middlewareElevated1FA`（需要已认证的 1FA 会话提升）
+- **代码位置**：`internal/server/handlers.go:335`
+
+#### 处理流程
+Handler 实现在 `internal/handlers/handler_webauthn_credentials.go:204-275`：
+
+```
+1. 验证用户会话
+   ↓
+2. 从 URL 路径解析 credentialID
+   ↓
+3. 按 ID 从数据库加载凭据
+   ↓
+4. 权限校验：凭据.Username == 当前会话.Username
+   ↓
+5. 调用存储层 DeleteWebAuthnCredential(凭据.KID.String())
+   ↓
+6. 记录审计日志（event_log_action2FARemoved）
+   ↓
+7. 返回 200 OK
+```
+
+#### 关键代码点
+```go
+if credential.Username != userSession.Username {
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    return
+}
+
+if err = ctx.Providers.StorageProvider.DeleteWebAuthnCredential(
+    ctx, credential.KID.String()); err != nil {
+    // 错误处理
+}
+```
+
+### 3.2 管理员强制清理（CLI 命令）
+
+#### 命令格式
+```bash
+authelia storage user webauthn delete john --all
+authelia storage user webauthn delete john --description "YubiKey 5"
+authelia storage user webauthn delete --kid "AAECAwQFBgcICQoLDA0ODw"
+```
+
+#### 代码入口
+- 命令定义：`internal/commands/storage.go:412` → `newStorageUserWebAuthnCmd`
+- RunE 函数：`internal/commands/storage_run.go:1444-1465` → `StorageUserWebAuthnDeleteRunE`
+
+#### 存储层删除函数
+
+**按 KID 删除**（`internal/storage/sql_provider.go:774-781`）：
+```go
+func (p *SQLProvider) DeleteWebAuthnCredential(ctx context.Context, kid string) error {
+    _, err := p.db.ExecContext(ctx, p.sqlDeleteWebAuthnCredential, kid)
+    // DELETE FROM webauthn_credentials WHERE kid = ?
+}
+```
+
+**按用户名/描述删除**（`internal/storage/sql_provider.go:783-801`）：
+```go
+func (p *SQLProvider) DeleteWebAuthnCredentialByUsername(
+    ctx context.Context, username, displayname string) error {
+    if len(displayname) == 0 {
+        // DELETE FROM webauthn_credentials WHERE username = ?
+    } else {
+        // DELETE FROM webauthn_credentials WHERE username = ? AND description = ?
+    }
+}
+```
+
+---
+
+## 4. 与活跃会话的关系
+
+### 4.1 会话数据结构
+**位置**：`internal/session/types.go:20-48`
+
+```go
+type UserSession struct {
+    Username    string
+    FirstFactorAuthnTimestamp  int64
+    SecondFactorAuthnTimestamp int64
+    AuthenticationMethodRefs   authorization.AuthenticationMethodsReferences
+    // 会话中只记录认证时间戳和认证方法引用，不绑定具体的凭据 ID 或 KID
+}
+```
+
+### 4.2 关键发现：**撤销不会立即使已有会话失效**
+
+会话认证状态是**一次性的**，在登录时验证通过后就不再检查凭据是否仍然存在。
+
+#### 授权中间件行为
+**位置**：`internal/middlewares/require_auth.go:11-21`
+
+```go
+func Require1FA(next RequestHandler) RequestHandler {
+    return func(ctx *AutheliaCtx) {
+        // 只检查认证级别，不检查凭据是否存在
+        if s.AuthenticationLevel(...) < authentication.OneFactor {
+            ctx.ReplyForbidden()
+            return
+        }
+        next(ctx)
+    }
+}
+```
+
+**影响**：
+- 用户删除硬件密钥后，**已登录的会话仍然有效**
+- 直到会话过期、用户主动登出、或需要重新认证时才会被拒绝
+
+#### 例外：需要会话提升的操作
+删除凭据本身需要 **Elevated Session**（会话提升）：
+- **位置**：`internal/server/handlers.go:335` → `middlewareElevated1FA`
+- 删除凭据时会检查提升会话是否有效
+- 但删除成功后，对其他已存在的普通会话没有影响
+
+---
+
+## 5. Passkey 第一因子登录与 discoverable 被动升级
+
+### 5.1 Passkey 第一因子登录入口
+
+**端点**（需 `EnablePasskeyLogin: true`）：
+- GET `/api/firstfactor/passkey` - 生成 Passkey 断言挑战
+- POST `/api/firstfactor/passkey` - 验证 Passkey 断言
+
+**路由注册**：`internal/server/handlers.go:321-324`
+```go
+if config.WebAuthn.EnablePasskeyLogin {
+    r.GET("/api/firstfactor/passkey", middlewareAPI(handlers.FirstFactorPasskeyGET))
+    r.POST("/api/firstfactor/passkey", middlewareAPI(handlers.FirstFactorPasskeyPOST))
+    r.POST("/api/secondfactor/password", middleware1FA(handlers.SecondFactorPasswordPOST(funcDelayPassword)))
+}
+```
+
+### 5.2 discoverable 被动升级机制
+
+**关键代码**：`internal/handlers/handler_firstfactor_passkey.go:220-244`
+
+```go
+for _, credential := range user.Credentials {
+    if bytes.Equal(credential.KID.Bytes(), c.ID) {
+        credential.UpdateSignInInfo(w.Config, ctx.GetClock().Now().UTC(), c)
+
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │  discoverable 被动升级：                                      │
+        // │  如果一个非 Passkey 的凭据被用于 Passkey 第一因子登录，         │
+        // │  自动升级为 discoverable=true                                 │
+        // └─────────────────────────────────────────────────────────────┘
+        if !credential.Discoverable {
+            credential.Discoverable = true
+
+            ctx.Logger.WithFields(map[string]any{
+                "kid": credential.KID.String(),
+                "rpid": credential.RPID,
+                "aaguid": credential.AAGUID.UUID.String(),
+                "username": credential.Username,
+                "description": credential.Description,
+            }).Debug("WebAuthn Credential Passively Upgraded to a Passkey")
+        }
+
+        ok = true
+
+        // UPDATE 写回：discoverable 已被上述代码改为 true
+        if err = ctx.Providers.StorageProvider.UpdateWebAuthnCredentialSignIn(ctx, credential); err != nil {
+            // 错误处理
+        }
+
+        break
+    }
+}
+```
+
+**被动升级触发条件**：
+1. 用户使用 **Passkey 第一因子** 登录（不是 2FA WebAuthn）
+2. 凭据在数据库中 `discoverable = false`（注册时非 Passkey）
+3. 该凭据实际上能被 Passkey 流程发现和使用（认证器支持）
+4. → 自动将 `discoverable` 设为 `true` 并写回数据库
+
+**设计意图**：将旧版安全密钥"升级"为 Passkey，支持后续免用户名登录。
+
+### 5.3 凭据加载的 discoverable 过滤
+
+Passkey 登录时的凭据加载回调：`internal/handlers/webauthn.go:48-69`
+
+```go
+func handlerWebAuthnDiscoverableLogin(ctx *middlewares.AutheliaCtx, rpid string) webauthn.DiscoverableUserHandler {
+    return func(rawID, userHandle []byte) (user webauthn.User, err error) {
+        // ... 加载 WebAuthnUser ...
+
+        if ctx.Configuration.WebAuthn.EnablePasskeyUpgrade {
+            // 升级模式：加载所有凭据，允许被动升级
+            u.Credentials, err = ctx.Providers.StorageProvider.LoadWebAuthnCredentialsByUsername(...)
+        } else {
+            // 非升级模式：只加载 discoverable=true 的 Passkey 凭据
+            u.Credentials, err = ctx.Providers.StorageProvider.LoadWebAuthnPasskeyCredentialsByUsername(...)
+        }
+        // LoadWebAuthnPasskeyCredentialsByUsername 传入第三参数为 TRUE
+        // → SQL: WHERE ... AND (? = FALSE OR discoverable = TRUE)
+        // → 只返回 discoverable=TRUE 的凭据
+    }
+}
+```
+
+**配置对凭据加载的影响**：
+| `EnablePasskeyUpgrade` | 凭据加载范围 | 被动升级？ |
+|------------------------|-------------|-----------|
+| `true` | 该用户所有 WebAuthn 凭据 | 可能触发 |
+| `false` | 仅 `discoverable=true` 的凭据 | 不可能（非 Passkey 凭据不加载） |
+
+---
+
+## 6. ValidatePasskeyLogin 拒绝分支完整路径
+
+### 6.1 Passkey 第一因子登录拒绝分支
+
+**代码位置**：`internal/handlers/handler_firstfactor_passkey.go:94-271`
+
+Passkey 1FA 登录的完整拒绝链路（从上到下按优先级排列）：
+
+```
+FirstFactorPasskeyPOST
+    │
+    ├─ 拒绝分支 1：获取 Session Provider 失败
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志：errStrUserSessionData
+    │
+    ├─ 拒绝分支 2：获取会话失败
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志：errStrUserSessionData
+    │
+    ├─ 拒绝分支 3：用户已认证（非匿名）
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志：errUserIsAlreadyAuthenticated
+    │   → doMarkAuthenticationAttempt（AuthTypePasskey）
+    │
+    ├─ 拒绝分支 4：请求体解析失败
+    │   → HTTP 400 + "Authentication failed, please retry later."
+    │   → 日志：errStrReqBodyParse
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 5：解析断言响应失败
+    │   → HTTP 400 + "Authentication failed, please retry later."
+    │   → 日志：errStrReqBodyParse
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 6：会话中无 WebAuthn 挑战数据
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："challenge session data is not present"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 7：获取 WebAuthn Provider 失败
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："error occurred provisioning the configuration"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 8：ValidatePasskeyLogin 密码学验证失败（核心！）
+    │   │
+    │   ├─ 子分支 8a：凭据已被删除
+    │   │   → handlerWebAuthnDiscoverableLogin 加载凭据时返回空列表
+    │   │   → go-webauthn 库找不到匹配公钥
+    │   │
+    │   ├─ 子分支 8b：签名验证失败
+    │   │   → 用数据库公钥验证浏览器签名不通过
+    │   │
+    │   ├─ 子分支 8c：RPID/Origin 不匹配
+    │   │
+    │   └─ 子分支 8d：签名计数器倒退（克隆检测）
+    │
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："error performing the login validation"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 9：返回的 User 对象类型错误
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："the user object was not of the correct type"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 10：凭据在数据库中找不到（冗余安全网）
+    │   → 遍历 user.Credentials 无匹配 KID → ok=false
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："credential was not found"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 11：CloneWarning 检测
+    │   → c.Authenticator.CloneWarning = true
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："authenticator sign count indicates that it is cloned"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 12：获取用户详情失败（LDAP/文件 backend）
+    │   → HTTP 403 + "Authentication failed, please retry later."
+    │   → 日志："error retrieving user details"
+    │   → doMarkAuthenticationAttempt
+    │
+    ├─ 拒绝分支 13：用户被封禁
+    │   → HTTP 401 + "Authentication failed, please retry later."
+    │   → regulation.ErrUserIsBanned
+    │   → doMarkAuthenticationAttempt
+    │
+    └─ 拒绝分支 14：会话重新生成失败
+        → HTTP 403 + "Authentication failed, please retry later."
+        → 日志："error regenerating the user session"
+        → doMarkAuthenticationAttempt
+```
+
+---
+
+## 7. 1FA Passkey 与 2FA Assertion 拒绝链路对比与排查优先级
+
+### 7.1 拒绝链路核心差异对比
+
+| 对比项 | 2FA WebAuthn Assertion | 1FA Passkey Login |
+|--------|-----------------------|-------------------|
+| **端点** | `/api/secondfactor/webauthn` | `/api/firstfactor/passkey` |
+| **前置条件** | 需要已完成 1FA（有会话） | 匿名会话 |
+| **Validate 函数** | `w.ValidateLogin()` | `w.ValidatePasskeyLogin()` |
+| **凭据加载方式** | 按用户名加载所有凭据 | 通过 userHandle 回调发现用户，再加载凭据 |
+| **discoverable 过滤** | 不过滤（全部加载） | 非升级模式下只加载 discoverable=true |
+| **discoverable 被动升级** | ❌ 无 | ✅ 有（`FirstFactorPasskeyPOST:224`） |
+| **凭据删除后失败点** | ValidateLogin + found=false 双重检查 | ValidatePasskeyLogin + ok=false 双重检查 |
+| **失败后会话状态** | 保留 1FA 会话 | 保持匿名 |
+| **失败日志关键词** | "validating a WebAuthn authentication challenge" | "validating a WebAuthn passkey authentication challenge" |
+| **AuthType** | `AuthTypeWebAuthn` | `AuthTypePasskey` |
+
+### 7.2 排查优先级指南
+
+当收到"认证失败"但需要区分原因时，按以下优先级排查：
+
+#### 优先级 1：高风险（优先排查）
+
+| 场景 | 排查方法 | 特征 |
+|------|---------|------|
+| **凭据已被管理员删除** | 搜索日志中 `"credential was not found"` | 同时出现于拒绝分支 10（Passkey）或拒绝分支 B（2FA） |
+| **签名验证失败** | 搜索日志中 `"error performing the login validation"` 或 `"error comparing the response"` | go-webauthn 库返回的详细错误，可能表示凭据被篡改或冒用 |
+| **CloneWarning 克隆检测** | 搜索日志中 `"authenticator sign count indicates that it is cloned"` | 明确表示凭据可能被克隆 |
+
+#### 优先级 2：配置/环境问题
+
+| 场景 | 排查方法 | 特征 |
+|------|---------|------|
+| **Session Provider 故障** | 搜索日志中 `errStrUserSessionData` | 通常伴随 Redis/数据库连接问题 |
+| **WebAuthn Provider 配置错误** | 搜索日志中 `"error occurred provisioning the configuration"` | RPID/Origin 配置不匹配 |
+| **用户被封禁** | 搜索日志中 `ErrUserIsBanned` | HTTP 401 而非 403 |
+
+#### 优先级 3：请求/会话问题
+
+| 场景 | 排查方法 | 特征 |
+|------|---------|------|
+| **会话中无挑战数据** | 搜索日志中 `"challenge session data is not present"` | 会话超时或浏览器清理 Cookie |
+| **请求体解析失败** | 搜索日志中 `errStrReqBodyParse` | 浏览器端 JS 错误或网络传输问题 |
+| **用户已认证** | 搜索日志中 `errUserIsAlreadyAuthenticated` | 用户刷新页面导致重复提交 |
+
+### 7.3 凭据删除后的排查路径
+
+**管理员删除凭据后，用户登录失败的排查顺序**：
+
+```
+1. 确认删除操作已执行
+   ├─ 运行: authelia storage user webauthn list <username>
+   └─ 确认目标凭据不在列表中
+
+2. 检查 Authelia 日志
+   ├─ Passkey 登录失败 → 搜索 "validating a WebAuthn passkey"
+   │   └─ 关键词: "credential was not found" 或 "error performing the login validation"
+   └─ 2FA 登录失败 → 搜索 "validating a WebAuthn authentication challenge"
+       └─ 关键词: "credential was not found" 或 "error comparing the response"
+
+3. 验证数据库状态
+   └─ 直接查询: SELECT * FROM webauthn_credentials WHERE username = '<username>';
+       └─ 确认行已物理删除
+
+4. 检查用户会话状态
+   ├─ 如果用户已登录 → 会话仍然有效，需等待过期或手动登出
+   └─ 如果用户未登录 → 下次登录时直接被拒绝
+```
+
+---
+
+## 8. 管理员执行 `storage user webauthn delete` 后 assertion 拒绝的完整分支
+
+### 8.1 删除操作执行
 
 ```bash
 authelia storage user webauthn delete john --all
@@ -293,7 +693,7 @@ SQL: DELETE FROM webauthn_credentials WHERE username = 'john'
 整行删除，包括 kid、public_key、discoverable、backup_eligible、backup_state 全部消失
 ```
 
-### 3.2 被删除用户下次登录时的拒绝分支
+### 8.2 被删除用户下次登录时的拒绝分支
 
 #### 场景 A：用户仍持有 1FA 会话，尝试 2FA WebAuthn 断言
 
@@ -416,7 +816,7 @@ LoadUserInfo(ctx, "john")
 如果没有其他 2FA 方式 → 用户被锁定，无法完成 2FA
 ```
 
-### 3.3 断言拒绝返回给客户端的信息
+### 8.3 断言拒绝返回给客户端的信息
 
 **HTTP 响应格式**：
 
@@ -441,134 +841,9 @@ LoadUserInfo(ctx, "john")
 
 ---
 
-## 4. 凭据撤销方式
+## 9. 多设备/多域名同步状态
 
-### 4.1 用户主动删除（Web UI）
-
-#### API 端点
-- **路由**：`DELETE /api/secondfactor/webauthn/credential/{credentialID}`
-- **中间件**：`middlewareElevated1FA`（需要已认证的 1FA 会话提升）
-- **代码位置**：`internal/server/handlers.go:335`
-
-#### 处理流程
-Handler 实现在 `internal/handlers/handler_webauthn_credentials.go:204-275`：
-
-```
-1. 验证用户会话
-   ↓
-2. 从 URL 路径解析 credentialID
-   ↓
-3. 按 ID 从数据库加载凭据
-   ↓
-4. 权限校验：凭据.Username == 当前会话.Username
-   ↓
-5. 调用存储层 DeleteWebAuthnCredential(凭据.KID.String())
-   ↓
-6. 记录审计日志（event_log_action2FARemoved）
-   ↓
-7. 返回 200 OK
-```
-
-#### 关键代码点
-```go
-if credential.Username != userSession.Username {
-    ctx.SetStatusCode(fasthttp.StatusForbidden)
-    return
-}
-
-if err = ctx.Providers.StorageProvider.DeleteWebAuthnCredential(
-    ctx, credential.KID.String()); err != nil {
-    // 错误处理
-}
-```
-
-### 4.2 管理员强制清理（CLI 命令）
-
-#### 命令格式
-```bash
-authelia storage user webauthn delete john --all
-authelia storage user webauthn delete john --description "YubiKey 5"
-authelia storage user webauthn delete --kid "AAECAwQFBgcICQoLDA0ODw"
-```
-
-#### 代码入口
-- 命令定义：`internal/commands/storage.go:412` → `newStorageUserWebAuthnCmd`
-- RunE 函数：`internal/commands/storage_run.go:1444-1465` → `StorageUserWebAuthnDeleteRunE`
-
-#### 存储层删除函数
-
-**按 KID 删除**（`internal/storage/sql_provider.go:774-781`）：
-```go
-func (p *SQLProvider) DeleteWebAuthnCredential(ctx context.Context, kid string) error {
-    _, err := p.db.ExecContext(ctx, p.sqlDeleteWebAuthnCredential, kid)
-    // DELETE FROM webauthn_credentials WHERE kid = ?
-}
-```
-
-**按用户名/描述删除**（`internal/storage/sql_provider.go:783-801`）：
-```go
-func (p *SQLProvider) DeleteWebAuthnCredentialByUsername(
-    ctx context.Context, username, displayname string) error {
-    if len(displayname) == 0 {
-        // DELETE FROM webauthn_credentials WHERE username = ?
-    } else {
-        // DELETE FROM webauthn_credentials WHERE username = ? AND description = ?
-    }
-}
-```
-
----
-
-## 5. 与活跃会话的关系
-
-### 5.1 会话数据结构
-**位置**：`internal/session/types.go:20-48`
-
-```go
-type UserSession struct {
-    Username    string
-    FirstFactorAuthnTimestamp  int64
-    SecondFactorAuthnTimestamp int64
-    AuthenticationMethodRefs   authorization.AuthenticationMethodsReferences
-    // 会话中只记录认证时间戳和认证方法引用，不绑定具体的凭据 ID 或 KID
-}
-```
-
-### 5.2 关键发现：**撤销不会立即使已有会话失效**
-
-会话认证状态是**一次性的**，在登录时验证通过后就不再检查凭据是否仍然存在。
-
-#### 授权中间件行为
-**位置**：`internal/middlewares/require_auth.go:11-21`
-
-```go
-func Require1FA(next RequestHandler) RequestHandler {
-    return func(ctx *AutheliaCtx) {
-        // 只检查认证级别，不检查凭据是否存在
-        if s.AuthenticationLevel(...) < authentication.OneFactor {
-            ctx.ReplyForbidden()
-            return
-        }
-        next(ctx)
-    }
-}
-```
-
-**影响**：
-- 用户删除硬件密钥后，**已登录的会话仍然有效**
-- 直到会话过期、用户主动登出、或需要重新认证时才会被拒绝
-
-#### 例外：需要会话提升的操作
-删除凭据本身需要 **Elevated Session**（会话提升）：
-- **位置**：`internal/server/handlers.go:335` → `middlewareElevated1FA`
-- 删除凭据时会检查提升会话是否有效
-- 但删除成功后，对其他已存在的普通会话没有影响
-
----
-
-## 6. 多设备/多域名同步状态
-
-### 6.1 凭据撤销的跨设备影响
+### 9.1 凭据撤销的跨设备影响
 
 | 场景 | 影响 |
 |------|------|
@@ -576,7 +851,7 @@ func Require1FA(next RequestHandler) RequestHandler {
 | **不同设备** | 各有各的会话，撤销不影响对方已登录状态 |
 | **Passkey 同步** | 硬件密钥内部的跨设备同步由厂商管理，Authelia 只在验证时检查凭据是否存在于数据库 |
 
-### 6.2 关键边界：Passkey 升级
+### 9.2 关键边界：Passkey 升级
 **位置**：`internal/handlers/webauthn.go:58-66`
 
 ```go
@@ -591,9 +866,9 @@ if ctx.Configuration.WebAuthn.EnablePasskeyUpgrade {
 
 ---
 
-## 7. 丢失硬件密钥后的立即处置清单
+## 10. 丢失硬件密钥后的立即处置清单
 
-### 7.1 第一步：删除凭据（立刻执行）
+### 10.1 第一步：删除凭据（立刻执行）
 
 ```bash
 # 方式 A：删除该用户所有 WebAuthn 凭据（推荐，最安全）
@@ -620,7 +895,7 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 - 删除是物理删除（DELETE FROM），**不可恢复**（除非有数据库备份）
 - 如果删除了用户的**唯一 2FA 方式**，用户将无法完成 2FA 登录
 
-### 7.2 第二步：处理活跃会话
+### 10.2 第二步：处理活跃会话
 
 **风险**：凭据删除后，用户在已登录设备上的会话仍然有效。
 
@@ -636,7 +911,7 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 - 如果丢失的密钥有被冒用的高风险（如无 PIN 保护的 U2F 密钥），建议重启 Authelia 或清空 session store
 - 如果密钥有 PIN/生物识别保护，等待会话自然过期即可
 
-### 7.3 第三步：风险评估与后续处理
+### 10.3 第三步：风险评估与后续处理
 
 #### 风险评估检查项
 
@@ -672,9 +947,9 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 
 ---
 
-## 8. 代码调用链总结
+## 11. 代码调用链总结
 
-### 8.1 用户删除流程
+### 11.1 用户删除流程
 ```
 前端 WebAuthnCredentialsPanel.tsx
     ↓ DELETE /api/secondfactor/webauthn/credential/{id}
@@ -690,7 +965,7 @@ internal/storage/sql_provider.go:775
     ↓ DELETE FROM webauthn_credentials WHERE kid = ?
 ```
 
-### 8.2 管理员删除流程
+### 11.2 管理员删除流程
 ```
 authelia storage user webauthn delete
     ↓
@@ -701,7 +976,7 @@ internal/commands/storage_run.go:1445 (StorageUserWebAuthnDeleteRunE)
     └─ byUser → DeleteWebAuthnCredentialByUsername(user, desc)
 ```
 
-### 8.3 登录时的撤销检测
+### 11.3 登录时的撤销检测
 ```
 POST /api/secondfactor/webauthn/assertion
     ↓
@@ -716,7 +991,7 @@ internal/handlers/handler_sign_webauthn.go:129 (WebAuthnAssertionPOST)
 
 ---
 
-## 9. 相关文件索引
+## 12. 相关文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
@@ -724,6 +999,7 @@ internal/handlers/handler_sign_webauthn.go:129 (WebAuthnAssertionPOST)
 | 用户删除 Handler | internal/handlers/handler_webauthn_credentials.go |
 | 注册 Handler | internal/handlers/handler_register_webauthn.go |
 | 登录验证 Handler | internal/handlers/handler_sign_webauthn.go |
+| Passkey 1FA Handler | internal/handlers/handler_firstfactor_passkey.go |
 | WebAuthn 辅助函数 | internal/handlers/webauthn.go |
 | 存储层实现 | internal/storage/sql_provider.go |
 | SQL 查询定义 | internal/storage/sql_provider_queries.go |
