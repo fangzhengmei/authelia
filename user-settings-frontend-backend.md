@@ -1384,19 +1384,91 @@ Regulator.HandleAttempt(successful, banned, ...)
 
 ## 十四、会话回写失败与认证状态的精准判定
 
-### 14.0 核心概念澄清
+### 14.0 请求内状态 vs 后续请求持久状态：核心界限
 
-> **⚠️ 关键理解**：认证状态是**内存中**的 `UserSession` 对象属性，而 `SaveSession` 只是**将会话持久化到 Cookie/Storage**。两者是分离的！
+> **⚠️ 最关键的理解**：Authelia的会话状态存在于**两个独立的空间**，SaveSession是连接它们的唯一桥梁！
 
-**认证状态生效点**：
-- 调用 `SetTwoFactorTOTP()` / `SetTwoFactorWebAuthn()` / `SetTwoFactorPassword()` 时
-- 这些方法修改 `AuthenticationMethodRefs` 字段，**立即生效于内存**
-- `AuthenticationLevel()` 方法根据 `AuthenticationMethodRefs` 实时计算认证级别
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    当前请求处理过程                              │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │              请求内状态（内存）                          │  │
+│  │  ─────────────────────────────────────────────────────  │  │
+│  │  • userSession 变量的副本                                │  │
+│  │  • SetTwoFactorTOTP() 立即修改此副本                     │  │
+│  │  • 只存在于当前请求的生命周期内                           │  │
+│  │  • 修改不影响其他请求                                    │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                              ↓ SaveSession()                   │
+│                              ✅ 成功 / ❌ 失败                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                               │
+├─────────────────────────────────────────────────────────────────┤
+│                后续请求持久状态（Session Store）                │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │              持久化状态（Cookie/Redis）                   │  │
+│  │  ─────────────────────────────────────────────────────  │  │
+│  │  • GetSession() 时从此处读取                             │  │
+│  │  • 跨请求共享                                           │  │
+│  │  • SaveSession() 成功才会更新                            │  │
+│  │  • SaveSession() 失败则保持旧状态                         │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-**SaveSession 的作用**：
-- 仅负责将内存中的 `UserSession` 序列化为 Cookie 或存储到 Redis
-- 不改变内存中的任何状态
-- 失败不影响内存中已设置的认证状态
+**核心概念定义**：
+
+| 概念 | 定义 | 生效时机 | 影响范围 |
+|-----|------|---------|---------|
+| **请求内状态** | 当前请求处理过程中 `userSession` 变量的内存副本 | 调用 `SetTwoFactor*()` 时**立即生效** | 仅当前请求 |
+| **持久状态** | 存储在 Session Store（Cookie/Redis）中的会话数据 | `SaveSession()` **成功后**才生效 | 所有后续请求 |
+
+**关键结论**：
+- SaveSession **不修改**请求内状态，它只负责将内存状态**复制**到持久存储
+- SaveSession 失败 → **请求内状态已改变，但持久状态仍是旧的**
+- 下次请求调用 GetSession() → 读取的是**旧的持久状态**
+- 这就是"认证已生效但下次请求看不到"的根本原因！
+
+---
+
+### 14.0.1 四种认证方式对比：生效时刻与持久状态
+
+| 认证方式 | 认证标记生效时刻（代码位置） | SaveSession调用时机 | 请求内认证状态 | SaveSession失败后下次请求看到的状态 | 前端最终呈现结果 |
+|---------|----------------------------|-------------------|---------------|----------------------------------|----------------|
+| **TOTP验证** | `SetTwoFactorTOTP()` 第195行 | 第197行，生效之后 | TwoFactor | **OneFactor**（旧状态） | 403 → 认证失败 |
+| **第二因子密码** | `SetTwoFactorPassword()` 第77行 | 第87行，生效之后 | TwoFactor | **OneFactor**（旧状态） | 401 → 认证失败 |
+| **WebAuthn验证** | `SetTwoFactorWebAuthn()` 第273行 | defer中，返回之后 | TwoFactor | **取决于defer是否成功** | 200 → 认证成功 |
+| **会话提升** | `Elevations.User = &Elevation{}` 第346行 | 第352行，生效之后 | 已提升 | **未提升**（旧状态） | 403 → 提升失败 |
+
+---
+
+### 14.0.2 统一判断标准（可复用）
+
+**标准1：判断请求内状态是否生效**
+```
+✅ 已生效 = SetTwoFactor*() 或 Elevations.User 赋值语句已执行
+❌ 未生效 = 上述语句未执行
+```
+
+**标准2：判断持久状态是否更新**
+```
+✅ 已更新 = SaveSession() 返回 nil（无错误）
+❌ 未更新 = SaveSession() 返回 error
+       = 或 SaveSession() 根本没调用
+```
+
+**标准3：判断下次请求看到的认证状态**
+```
+下次请求状态 = SaveSession() 成功 ? 请求内状态 : 旧的持久状态
+```
+
+**标准4：判断前端最终呈现结果**
+```
+前端结果 = HTTP状态码 + 响应体status字段
+         与后端实际状态可能完全不一致！
+```
 
 ---
 
@@ -1572,12 +1644,23 @@ if err = ctx.Providers.UserProvider.ChangePassword(username, old, new); err != n
 if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
     // ⚠️ 即使这里失败，密码已经改了！
     ctx.SetJSONError(messageOperationFailed)
-    // ⚠️ 注意：没有 SetStatusCode！默认是200？
+    // ⚠️ SetJSONError 调用 ReplyJSON(data, 0)
+    // ⚠️ statusCode=0 表示不修改HTTP状态码 → 默认保持200！
     return
 }
 
 // 3. 发送通知邮件，返回OK
 ctx.ReplyOK()
+```
+
+**SetJSONError 实现** (`authelia_context.go:83-87`)：
+```go
+func (ctx *AutheliaCtx) SetJSONError(message string) {
+    // statusCode = 0 → 不设置HTTP状态码！
+    if err := ctx.ReplyJSON(ErrorResponse{Status: "KO", Message: message}, 0); err != nil {
+        ctx.Logger.Error(err)
+    }
+}
 ```
 
 **关键发现**：修改密码流程中，`userSession` 本身**没有任何修改**，SaveSession 实际上是多余的调用！
@@ -1587,78 +1670,90 @@ ctx.ReplyOK()
 |-------|------|---------|
 | **密码已修改？** | ✅ **是** | `ChangePassword()` 在 SaveSession 之前调用，已写入 UserProvider |
 | **Session有修改？** | ❌ **否** | 代码中没有修改 userSession 的任何字段 |
-| **HTTP响应码** | 200 OK | 没有 SetStatusCode，默认返回200 |
-| **响应体** | `{"status":"KO","message":"Operation failed"}` | SetJSONError 设置了错误消息 |
-| **前端感知** | 密码修改失败 | 前端检测到 status="KO"，显示错误通知 |
+| **HTTP响应码** | **200 OK** | SetJSONError 传入 statusCode=0，不修改默认状态码 |
+| **响应体** | `{"status":"KO","message":"Operation failed"}` | SetJSONError 设置了错误消息体 |
+| **前端感知** | 密码修改失败 | PostWithOptionalResponse 检测到 status="KO" 抛出异常 |
 | **实际状态** | 密码已改但前端显示失败 | 最严重的不一致场景！ |
 
 ---
 
-### 14.2 修改密码流程回写失败的前端观察结果
+### 14.2 修改密码流程：为什么会出现"操作已完成但前端报错"？
 
-**前端错误处理** (`ChangePasswordDialog.tsx:129-161`)：
+**完整链路分析**：
+
+**步骤1：后端处理**
+```
+ChangePassword(username, old, new)
+    ↓ ✅ 成功（密码已写入LDAP/数据库）
+SaveSession(userSession)
+    ↓ ❌ 失败（Cookie/Redis问题，但userSession没变！）
+SetJSONError("Operation failed")
+    ↓
+ReplyJSON(data, 0)  → statusCode=0 → HTTP 200
+    ↓
+响应体：{"status":"KO","message":"Operation failed"}
+```
+
+**步骤2：前端接收** (`Client.ts:26-38`)：
+```typescript
+export async function PostWithOptionalResponse<T = undefined>(
+    path: string,
+    body?: any,
+    signal?: AbortSignal,
+): Promise<T | undefined> {
+    const res = await axios.post<ServiceResponse<T>>(path, body, { signal });
+
+    // ⚠️ 关键判断：HTTP状态码不是200 OR 有服务错误
+    if (res.status !== 200 || hasServiceError(res).errored) {
+        throw new Error(`Failed POST to ${path}. Code: ${res.status}. Message: ${hasServiceError(res).message}`);
+    }
+
+    return toData<T>(res);
+}
+```
+
+**步骤3：前端异常处理** (`ChangePasswordDialog.tsx:129-161`)：
 ```typescript
 try {
     await postPasswordChange(props.username, oldPassword, newPassword);
     createSuccessNotification("Password changed successfully");
-    handleClose();  // ✅ 成功：关闭对话框
+    handleClose();  // 不会执行到这里
 } catch (err) {
-    resetPasswordErrors();
-    setLoading(false);
-    
-    if (axios.isAxiosError(err) && err.response) {
-        switch (err.response.status) {
-            case 400:  // 弱密码
-                setNewPasswordError(true);
-                createErrorNotification("Password does not meet policy");
-                break;
-            case 401:  // 旧密码错误
-                setOldPasswordError(true);
-                createErrorNotification("Incorrect password");
-                break;
-            case 500:  // 服务器错误
-            default:
-                createErrorNotification("There was an issue changing the password");
-                break;
-        }
-    }
-    // ❌ 失败：对话框保持打开，允许重试
-    return;
+    // ✅ 被 catch 捕获！
+    createErrorNotification("There was an issue changing the password");
+    // 对话框保持打开，用户以为失败了
 }
 ```
 
-**⚠️ 但是**：修改密码的 SaveSession 失败时，后端返回的是 **200 OK + status="KO"**，这不会触发 axios 的 catch 分支！
+**根本原因总结**：
 
-**实际前端行为**：
-1. `postPasswordChange` 调用返回成功（HTTP 200）
-2. `PostWithOptionalResponse` 检测到 `status="KO"`，**抛出异常**
-3. catch 分支被触发
-4. 显示通用错误通知："There was an issue changing the password"
-5. 对话框**保持打开**，允许用户重试
-6. **但密码实际上已经修改了！**
+| 层级 | 状态 | 说明 |
+|-----|------|------|
+| **UserProvider** | ✅ 密码已修改 | LDAP/数据库中的密码确实更新了 |
+| **Session** | ⚪ 无变化 | userSession 没有任何字段修改，SaveSession是多余调用 |
+| **HTTP状态码** | ✅ 200 OK | SetJSONError 不修改默认状态码 |
+| **响应体status** | ❌ "KO" | SetJSONError 设置了错误标记 |
+| **前端判断** | ❌ 失败 | PostWithOptionalResponse 检测到 status="KO" 抛出异常 |
+| **用户感知** | ❌ 修改失败 | 看到错误通知，对话框不关闭 |
 
-**用户体验问题**：
-- 用户看到"密码修改失败"的错误提示
-- 但旧密码已经失效，新密码已生效
-- 用户再次尝试时，旧密码验证失败（401），更加困惑
-- 这是最严重的状态不一致场景
+**最讽刺的地方**：即使 SaveSession 成功了，由于 userSession 没有任何修改，持久状态也不会有任何变化！这个 SaveSession 调用从一开始就是多余的。
 
 ---
 
 ### 14.3 认证状态与响应码决策表（可复用）
 
-| 操作场景 | 认证/操作生效点 | SaveSession 调用时机 | 内存状态 | SaveSession失败HTTP响应 | 前端感知 | 实际状态 | 不一致风险 |
-|---------|---------------|-------------------|---------|----------------------|---------|---------|-----------|
-| **TOTP验证** | `SetTwoFactorTOTP()` 第195行 | 第197行，生效之后 | TwoFactor | 403 Forbidden | 认证失败 | 已认证 | ⚠️ 高 |
-| **密码验证(2FA)** | `SetTwoFactorPassword()` 第77行 | 第87行，生效之后 | TwoFactor | 401 Unauthorized | 认证失败 | 已认证 | ⚠️ 高 |
-| **WebAuthn验证** | `SetTwoFactorWebAuthn()` 第273行 | defer 中，返回之后 | TwoFactor | 200 OK | 认证成功 | 已认证 | ✅ 低 |
-| **会话提升PUT** | `Elevations.User = &Elevation{}` 第346行 | 第352行，生效之后 | 已提升 | 403 Forbidden | 提升失败 | 已提升 | ⚠️ 中 |
-| **会话提升GET清理** | `Elevations.User = nil` 第96行 | 第98行，生效之后 | 未提升 | 403 Forbidden | 获取失败 | 已清除 | ✅ 低 |
-| **WebAuthn挑战生成** | `userSession.WebAuthn = &data` 第105行 | 第107行，生效之后 | 有挑战 | 403 Forbidden | 获取失败 | 已设置 | ✅ 低 |
-| **修改密码** | `ChangePassword()` 第61行 | 第96行，生效之后 | 无变化 | 200 OK (status=KO) | 修改失败 | 已修改 | 🔴 极高 |
-| **重置密码清理** | `PasswordResetUsername = &username` 第281行 | 第283行，生效之后 | 已标记 | 静默（仅日志） | 无感 | 已标记 | ✅ 低 |
-| **LastActivity更新** | `LastActivity = now` 中间件中 | SaveSessionIfRequired | 已更新 | 静默失败 | 无感 | 已更新 | ✅ 低 |
-| **用户信息刷新** | `Emails/Groups/DisplayName` 更新 | SaveSession 中间件中 | 已更新 | 200 OK | 无感 | 已更新 | ⚠️ 中 |
+| 操作场景 | 认证/操作生效点 | SaveSession 调用时机 | 请求内内存状态 | SaveSession失败HTTP响应 | 下次请求持久状态 | 前端感知 | 实际操作状态 | 不一致风险 |
+|---------|---------------|-------------------|-------------|----------------------|---------------|---------|-----------|-----------|
+| **TOTP验证** | `SetTwoFactorTOTP()` 第195行 | 第197行，生效之后 | TwoFactor | 403 Forbidden | **OneFactor**（旧状态） | 认证失败 | 本次请求内已认证 | ⚠️ 高 |
+| **密码验证(2FA)** | `SetTwoFactorPassword()` 第77行 | 第87行，生效之后 | TwoFactor | 401 Unauthorized | **OneFactor**（旧状态） | 认证失败 | 本次请求内已认证 | ⚠️ 高 |
+| **WebAuthn验证** | `SetTwoFactorWebAuthn()` 第273行 | defer 中，返回之后 | TwoFactor | 200 OK | **取决于defer** | 认证成功 | 已认证 | ✅ 低 |
+| **会话提升PUT** | `Elevations.User = &Elevation{}` 第346行 | 第352行，生效之后 | 已提升 | 403 Forbidden | **未提升**（旧状态） | 提升失败 | 本次请求内已提升 | ⚠️ 中 |
+| **会话提升GET清理** | `Elevations.User = nil` 第96行 | 第98行，生效之后 | 未提升 | 403 Forbidden | **已提升**（旧状态） | 获取失败 | 本次请求内已清除 | ✅ 低 |
+| **WebAuthn挑战生成** | `userSession.WebAuthn = &data` 第105行 | 第107行，生效之后 | 有挑战 | 403 Forbidden | **无挑战**（旧状态） | 获取失败 | 本次请求内已设置 | ✅ 低 |
+| **修改密码** | `ChangePassword()` 第61行 | 第96行，生效之后 | 无变化 | 200 OK (status=KO) | **无变化** | 修改失败 | UserProvider已修改 | 🔴 极高 |
+| **重置密码清理** | `PasswordResetUsername = &username` 第281行 | 第283行，生效之后 | 已标记 | 静默（仅日志） | **未标记**（旧状态） | 无感 | 本次请求内已标记 | ✅ 低 |
+| **LastActivity更新** | `LastActivity = now` 中间件中 | SaveSessionIfRequired | 已更新 | 静默失败 | **旧时间**（旧状态） | 无感 | 本次请求内已更新 | ✅ 低 |
+| **用户信息刷新** | `Emails/Groups/DisplayName` 更新 | SaveSession 中间件中 | 已更新 | 200 OK | **旧信息**（旧状态） | 无感 | 本次请求内已更新 | ⚠️ 中 |
 
 ---
 
