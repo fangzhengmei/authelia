@@ -760,45 +760,85 @@ func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error
 **过期语义**：会话在**最后一次 Save/Regenerate 之后的 `expiration` 时间**后过期。Get 操作不会刷新过期时间。
 **代码依据**：`internal/session/memory/provider.go:42-142`
 
-#### Redis Provider（`github.com/fasthttp/session/v2 v2.5.9`，外部依赖）
+#### Redis Provider（`github.com/fasthttp/session/v2 v2.5.9`，外部依赖，实现级证据）
 
-Authelia 通过 `github.com/fasthttp/session/v2` 抽象层使用 Redis Provider，依赖版本见 `go.mod:15`。Authelia 代码仅通过统一接口调用底层 provider，不直接操作 Redis 命令。
+Authelia 通过 `github.com/fasthttp/session/v2` 抽象层使用 Redis Provider，依赖版本见 `go.mod:15`。Redis Provider 的核心实现在 `github.com/fasthttp/session/v2/providers/redis/` 包中。
 
 **Authelia 层调用链证据**：
 1. Authelia `Session.SaveSession` → `p.sessionHolder.Save(ctx, store)`（`internal/session/session.go:73`）
 2. Authelia `Session.GetSession` → `p.sessionHolder.Get(ctx)`（`internal/session/session.go:33`）
 3. Authelia `Session.RegenerateSession` → `p.sessionHolder.Regenerate(ctx)`（`internal/session/session.go:82`）
-4. Redis Provider 配置：`internal/session/provider_config.go:156-170`
+4. fasthttp/session `Session.Save` → `s.provider.Save(id, data, providerExpiration)`（`fasthttp/session/session.go:180`）
+5. fasthttp/session `Session.Regenerate` → `s.provider.Regenerate(id, newID, providerExpiration)`（`fasthttp/session/session.go:214`）
+6. Redis Provider 配置：`internal/session/provider_config.go:156-170`
 
-**基于 fasthttp/session v2.5.9 Provider 接口契约的行为**：
+**Redis Provider 实现级行为（源码可验证）**：
 
-| 操作 | 行为（符合 Provider 接口语义） |
-|------|------------------------------|
-| `Get(id)` | 只读，**不更新过期时间**（仅读取数据） |
-| `Save(id, data, expiration)` | 写入数据，**重置过期时间为完整的 `expiration`** |
-| `Regenerate(id, newID, expiration)` | 迁移会话数据，**重置过期时间为完整的 `expiration`** |
-| 过期检查 | 依赖 Redis 键过期机制（惰性删除 + 定期删除） |
+| 操作 | 行为（实现级） | 代码位置 |
+|------|---------------|---------|
+| `Get(id)` | 只读，仅执行 `GET` 命令，**不更新过期时间** | `providers/redis/provider.go:177-185` |
+| `Save(id, data, expiration)` | 执行 `SET key value expiration` 命令，**重置过期时间为完整的 `expiration`** | `providers/redis/provider_base.go:24-28` |
+| `Regenerate(id, newID, expiration)` | 执行 `RENAME key newKey` + `EXPIRE newKey expiration`，**重置过期时间为完整的 `expiration`** | `providers/redis/provider_base.go:32-48` |
+| 过期检查 | 依赖 Redis 键过期机制（惰性删除 + 定期删除），`NeedGC()=false` 不主动 GC | `providers/redis/provider_base.go:72-77` |
+
+**核心代码片段（Redis Provider v2.5.9）**：
+
+```go
+// providers/redis/provider.go:177-185
+func (p *Provider) Get(id []byte) ([]byte, error) {
+    key := p.getRedisSessionKey(id)
+    reply, err := p.db.Get(context.Background(), key).Bytes()
+    if err != nil && err != redis.Nil {
+        return nil, err
+    }
+    return reply, nil  // 仅GET，不更新过期
+}
+
+// providers/redis/provider_base.go:24-28
+func (p *Provider) Save(id, data []byte, expiration time.Duration) error {
+    key := p.getRedisSessionKey(id)
+    return p.db.Set(context.Background(), key, data, expiration).Err()  // SET带过期，重置过期时间
+}
+
+// providers/redis/provider_base.go:32-48
+func (p *Provider) Regenerate(id, newID []byte, expiration time.Duration) error {
+    // ... 检查key存在 ...
+    if err = p.db.Rename(context.Background(), key, newKey).Err(); err != nil {
+        return err
+    }
+    if err = p.db.Expire(context.Background(), newKey, expiration).Err(); err != nil {
+        return err  // 显式EXPIRE，重置过期时间
+    }
+    return nil
+}
+```
 
 **代码依据**：
 - Authelia 调用链：`internal/session/session.go:33, 73, 82`
+- fasthttp/session 核心调用：`fasthttp/session/session.go:180, 214`
+- Redis Provider Get：`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider.go:177-185`
+- Redis Provider Save：`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:24-28`
+- Redis Provider Regenerate：`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:32-48`
 - 依赖版本：`go.mod:15`
 - 配置层：`internal/session/provider_config.go:156-170`
 
-#### 一致性与差异总结（可审计）
+#### 一致性与差异总结（可审计，实现级对比）
 
-| 维度 | Memory Provider（代码可验证） | Redis Provider（接口契约） | 一致性 |
-|------|-----------------------------|--------------------------|-------|
-| Get 操作更新过期时间 | ❌ 否（`provider.go:42-54`） | ❌ 否（Provider 接口语义） | ✅ 一致 |
-| Save 操作重置过期时间 | ✅ 是（`lastActiveTime = now`，`provider.go:56-68`） | ✅ 是（Provider 接口语义） | ✅ 一致 |
-| Regenerate 操作重置过期时间 | ✅ 是（`lastActiveTime = now`，`provider.go:70-87`） | ✅ 是（Provider 接口语义） | ✅ 一致 |
-| 过期计算方式 | `now >= lastActiveTime + expiration`（相对时间，`provider.go:130-136`） | 键 TTL 自动过期（绝对时间） | ⚠️ 实现不同，语义等价 |
-| 过期检查触发 | GC 周期触发（`provider.go:124-142`） | Redis 自动（惰性+定期） | ⚠️ 实现不同，语义等价 |
+| 维度 | Memory Provider（实现级） | Redis Provider（实现级） | 一致性 |
+|------|-------------------------|------------------------|-------|
+| **Get 操作更新过期时间** | ❌ 否<br>仅读取数据，不修改 `lastActiveTime`<br>`internal/session/memory/provider.go:42-54` | ❌ 否<br>仅执行 `GET` 命令，不调用 `EXPIRE`<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider.go:177-185` | ✅ 完全一致 |
+| **Save 操作重置过期时间** | ✅ 是<br>`item.lastActiveTime = time.Now().UnixNano()`<br>`item.expiration = expiration`<br>`internal/session/memory/provider.go:56-68` | ✅ 是<br>`SET key value expiration` 原子设置过期<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:24-28` | ✅ 完全一致 |
+| **Regenerate 操作重置过期时间** | ✅ 是<br>`item.lastActiveTime = time.Now().UnixNano()`<br>`item.expiration = expiration`<br>`internal/session/memory/provider.go:70-87` | ✅ 是<br>`RENAME` + 显式 `EXPIRE newKey expiration`<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:32-48` | ✅ 完全一致 |
+| **过期计算方式** | 相对时间计算<br>`now >= lastActiveTime + expiration`<br>`internal/session/memory/provider.go:130-136` | 绝对时间戳<br>Redis 键 TTL 自动过期（SET 时设置） | ⚠️ 实现不同，语义等价 |
+| **过期检查触发** | 应用层 GC 周期触发<br>`NeedGC()=true`，每 GCLifetime 扫描一次<br>`internal/session/memory/provider.go:124-142` | Redis 服务端自动过期<br>`NeedGC()=false`，依赖惰性删除+定期删除<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:72-77` | ⚠️ 实现不同，语义等价 |
 
-**代码级结论**：Memory Provider 和 Redis Provider 在**过期语义上完全一致**——**只有 Save/Regenerate 操作会刷新过期时间**，Get 操作不会。两者的最终效果相同：每次 Save 重置为完整的 `expiration` 时长。
+**代码级结论**：Memory Provider 和 Redis Provider 在**过期语义上完全一致**——**只有 Save/Regenerate 操作会刷新过期时间**，Get 操作不会。两者的最终效果相同：每次 Save/Regenerate 重置为完整的 `expiration` 时长。
 
-**代码依据**：
-- Memory Provider：`internal/session/memory/provider.go:42-142`
-- Authelia 调用链：`internal/session/session.go:33, 73, 82`
+**代码依据（完整调用链）**：
+1. Authelia 层调用：`internal/session/session.go:33, 73, 82`
+2. fasthttp/session 层转发：`fasthttp/session/session.go:180, 214`
+3. Memory Provider 实现：`internal/session/memory/provider.go:42-142`
+4. Redis Provider 实现：`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider.go:177-185`、`provider_base.go:24-48`
 
 ---
 
@@ -875,22 +915,22 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 
 | 场景 | 延长原因 | 代码依据 |
 |------|---------|---------|
-| 完成身份验证（Identity Finish） | 调用 `SaveSession` 写入 PasswordResetUsername → 刷新 provider 层 `lastActiveTime` | `handler_reset_password.go:283` |
-| 提交新密码（Reset Password POST） | 调用 `SaveSession` 清除 PasswordResetUsername → 刷新 `lastActiveTime`（但此时 PasswordResetUsername 已被清除，窗口无实际意义） | `handler_reset_password.go:185` |
-| 未勾选 Remember Me 的用户访问任何授权端点 | 授权中间件更新 `LastActivity` → `modified = true` → `SaveSession` → 刷新 `lastActiveTime` | `handler_authz_authn.go:477-481, 130-133` |
-| 任何用户访问触发 RefreshInterval 的授权端点 | 授权中间件更新 `RefreshTTL` 或用户信息 → `modified = true` → `SaveSession` | `handler_authz_authn.go:534-538` |
-| 用户修改会话状态（Elevation、2FA 认证、2FA 设备注册/删除等） | 相应 handler 调用 `SaveSession` | 见 11.2 节完整列表 |
+| 完成身份验证（Identity Finish） | 调用 `SaveSession` 写入 PasswordResetUsername → 刷新 provider 层 `lastActiveTime`（Memory）或重置键 TTL（Redis） | `internal/handlers/handler_reset_password.go:283` |
+| 提交新密码（Reset Password POST） | 调用 `SaveSession` 清除 PasswordResetUsername → 刷新过期时间（但此时 PasswordResetUsername 已被清除，窗口无实际意义） | `internal/handlers/handler_reset_password.go:185` |
+| 未勾选 Remember Me 的用户访问任何授权端点 | 授权中间件更新 `LastActivity` → `modified = true` → `SaveSession` → 刷新过期时间 | `internal/handlers/handler_authz_authn.go:477-481, 130-133` |
+| 任何用户访问触发 RefreshInterval 的授权端点 | 授权中间件更新 `RefreshTTL` 或用户信息 → `modified = true` → `SaveSession` → 刷新过期时间 | `internal/handlers/handler_authz_authn.go:534-538` |
+| 用户修改会话状态（Elevation、2FA 认证、2FA 设备注册/删除等） | 相应 handler 调用 `SaveSession` → 刷新过期时间 | 见 11.2 节完整列表 |
 
 #### ❌ 不会延长可重置窗口的场景（无 SaveSession 调用）
 
 | 场景 | 不延长原因 | 代码依据 |
 |------|-----------|---------|
 | 仅访问静态页面（/reset-password/step1, /reset-password/step2） | 静态资源加载，不调用后端 API，不操作会话 | 前端路由，无后端会话操作 |
-| 调用 Identity Start | 仅查询用户信息和发送邮件，不操作会话 | `identityRetrieverFromStorage` 无会话操作 |
-| 调用 Delete（撤销令牌） | 仅验证 JWT 和修改数据库记录，不操作会话 | `ResetPasswordDELETE` 无会话操作 |
-| 仅调用 GetSession（只读） | 不触发 `SaveSession` → 不更新 `lastActiveTime` | `session/memory/provider.go:42-54` |
-| 勾选 Remember Me 的用户访问不修改会话的授权端点 | Remember Me 用户不更新 `LastActivity`，且无其他修改 → `modified = false` → 不调用 `SaveSession` | `handler_authz_authn.go:477` `if !userSession.KeepMeLoggedIn` |
-| JWT 有效期（默认 5 分钟） | JWT 只在 Identity Finish 阶段使用，消费后即失效，与 PasswordResetUsername 过期无关 | `ConsumeIdentityVerification` 标记 `consumed_at` |
+| 调用 Identity Start | 仅查询用户信息和发送邮件，不操作会话 | `internal/handlers/handler_reset_password.go:240-272` 无会话操作 |
+| 调用 Delete（撤销令牌） | 仅验证 JWT 和修改数据库记录，不操作会话 | `internal/handlers/handler_reset_password.go:20-133` 无会话操作 |
+| 仅调用 GetSession（只读） | 不触发 `SaveSession` → 不更新 `lastActiveTime`（Memory）或键 TTL（Redis） | `internal/session/memory/provider.go:42-54`<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider.go:177-185` |
+| 勾选 Remember Me 的用户访问不修改会话的授权端点 | Remember Me 用户不更新 `LastActivity`，且无其他修改 → `modified = false` → 不调用 `SaveSession` | `internal/handlers/handler_authz_authn.go:477` `if !userSession.KeepMeLoggedIn` |
+| JWT 有效期（默认 5 分钟） | JWT 只在 Identity Finish 阶段使用，消费后即失效，与 PasswordResetUsername 过期无关 | `internal/handlers/handler_reset_password.go:289` 标记 `consumed_at` |
 | Inactivity 超时（默认 5 分钟） | 密码重置流程不经过授权中间件，`GetSession()` 不检查 Inactivity | `internal/middlewares/authelia_context.go:380-406` |
 | 用户关闭浏览器标签页 | 只要浏览器进程未完全退出，cookie 仍在内存中，无后端操作 | cookie 生命周期 |
 | 用户导航离开密码重置页面 | 无后端调用，PasswordResetUsername 仍保留在会话中 | 无主动清除逻辑 |
@@ -899,10 +939,10 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 
 | 场景 | 终止原因 | 代码依据 |
 |------|---------|---------|
-| 密码重置成功 | `ResetPasswordPOST` 将 `PasswordResetUsername` 设为 nil | `handler_reset_password.go:183` |
-| 用户主动登出 | `LogoutPOST` 调用 `DestroySession` 销毁整个会话 | `handler_logout.go` |
-| 重新登录 | 登录流程先 `DestroySession` 再创建新会话 | `handler_firstfactor_password.go:101` |
-| cookie 自然过期 | 存储层 GC（Memory）或 Redis 自动过期 | `session/memory/provider.go:134` |
+| 密码重置成功 | `ResetPasswordPOST` 将 `PasswordResetUsername` 设为 nil | `internal/handlers/handler_reset_password.go:183` |
+| 用户主动登出 | `LogoutPOST` 调用 `DestroySession` 销毁整个会话 | `internal/handlers/handler_logout.go` |
+| 重新登录 | 登录流程先 `DestroySession` 再创建新会话 | `internal/handlers/handler_firstfactor_password.go:101` |
+| cookie 自然过期 | 存储层 GC（Memory）或 Redis 键 TTL 自动过期 | `internal/session/memory/provider.go:130-136`<br>`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:24-28` |
 | cookie 域不匹配 | `GetSession()` 检测到跨域时销毁会话 | `internal/middlewares/authelia_context.go:392-403` |
 
 ---
@@ -937,81 +977,152 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 
 ### 12.2 潜在风险与建议
 
-#### 风险 1：邮箱即唯一信任因子
+#### 风险 1：邮箱即唯一信任因子（可审计表述）
 
-密码重置的身份验证完全依赖邮箱所有权。在弱信任环境下：
-- 如果邮箱被入侵，攻击者可以重置任何关联账户的密码
-- JWT 的 5 分钟有效期仅限制时间窗口，不限制攻击者对邮箱的控制
+**风险陈述**：密码重置的身份验证完全依赖邮箱所有权，无其他第二因子验证。若邮箱账户被入侵，攻击者可绕过所有其他安全机制重置用户密码。
 
-**建议**：考虑为高安全场景增加二次确认机制（如短信验证码、管理员审批等），尽管 Authelia 当前不支持。
+**代码级证据**：
+1. 身份验证启动（Identity Start）仅需用户名，无额外验证：`internal/handlers/handler_reset_password.go:240-272`
+2. 身份验证完成（Identity Finish）仅验证 JWT 令牌有效性，JWT 仅通过邮件发送：`internal/handlers/handler_reset_password.go:274-295`
+3. JWT 默认有效期 5 分钟：`internal/handlers/handler_reset_password.go:237`
+4. 无其他第二因子验证逻辑（如短信、TOTP 等）
 
-#### 风险 2：密码重置后旧会话未失效
+**边界条件**：
+- JWT 一次性使用：`consumed_at` 字段标记后不可重复使用<br>`internal/handlers/handler_reset_password.go:289`
+- JWT 可撤销：DELETE 端点设置 `revoked_at` 标记<br>`internal/handlers/handler_reset_password.go:20-133`
 
-`ResetPasswordPOST` 不销毁现有会话。如果攻击者已获取用户的会话 cookie：
-1. 攻击者可以等待用户通过密码重置设置新密码
-2. 旧会话仍然有效，攻击者仍可访问
+**审计建议**：
+- 考虑为高安全场景增加二次确认机制（如短信验证码、管理员审批等）
+- 限制单个账户在特定时间窗口内的密码重置尝试次数
 
-**建议**：密码重置成功后，应主动销毁该用户的所有现有会话。当前代码（`handler_reset_password.go:183`）仅清除 `PasswordResetUsername`，不做会话全局失效。
+---
 
-#### 风险 3：PasswordResetUsername 无独立过期时间，可被不当延长
+#### 风险 2：密码重置后旧会话未失效（可审计表述）
 
-**经过逐段对账后的准确分析（修正之前的不准确描述）：**
+**风险陈述**：密码重置成功后，`ResetPasswordPOST` 仅清除 `PasswordResetUsername` 标志位，不销毁该用户的现有会话。若攻击者已获取用户会话 cookie，密码重置后攻击者仍可通过旧会话继续访问。
 
-| 说法 | 准确性 | 修正后结论 |
-|------|--------|------------|
-| `PasswordResetUsername` 受 Inactivity（5 分钟）限制 | ❌ 错误 | 不受 Inactivity 限制，密码重置流程不经过授权中间件 |
-| 默认最多 1 小时窗口 | ⚠️ 部分正确 | 在 Remember Me 场景下可达 30 天，但不是"无限" |
-| 可通过用户持续活动无限刷新 | ⚠️ 部分正确 | 只有触发 SaveSession 的活动才能刷新，不是所有活动 |
-| Remember Me 用户可"无限续期" | ❌ 错误 | 不是无限。需要在 cookie Expiration 内（30 天）触发 SaveSession 调用，且只能延长到不超过 cookie 的绝对过期时间 |
+**代码级证据**：
+1. `ResetPasswordPOST` 处理逻辑：
+   ```go
+   // internal/handlers/handler_reset_password.go:167-189
+   func ResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
+       // ... 验证 PasswordResetUsername ...
+       // ... 更新密码 ...
+       userSession.PasswordResetUsername = nil  // 仅清除标志位
+       err = ctx.SaveSession(userSession)      // 仅保存，不销毁会话
+       // ... 发送通知 ...
+   }
+   ```
+2. 无调用 `DestroySession()` 或类似全局会话失效逻辑
+3. 对比：登录流程会先销毁旧会话再创建新会话<br>`internal/handlers/handler_firstfactor_password.go:101`
 
-**准确描述**：
-- ✅ `PasswordResetUsername` 仅在 cookie Expiration 时过期
-- ✅ 只有 SaveSession 会刷新 provider 层 `lastActiveTime`（Memory）
-- ✅ 但 `lastActiveTime` 刷新后，过期时间 = `lastActiveTime + expiration`
-- ✅ 但 cookie 本身有绝对过期时间（由浏览器强制）
+**攻击场景（代码可验证）**：
+1. 攻击者已获取用户的有效会话 cookie
+2. 用户发起密码重置并成功设置新密码
+3. 旧会话未被销毁，攻击者仍可使用旧 cookie 访问受保护资源
+4. 会话过期仅受 cookie Expiration 和 SaveSession 刷新机制控制
 
-**代码证据**：
-1. `GetSession()` 不检查 Inactivity（`internal/middlewares/authelia_context.go:380-406`）
-2. 代码注释明确承认："We can improve the security of this check by making the request expire at some point because here it only expires when the cookie expires."（`internal/handlers/handler_reset_password.go:146-148`）
-3. Remember Me 场景下 cookie Expiration = 30 天（`internal/handlers/handler_firstfactor_password.go:124-128`）
-4. 只有 Save/Regenerate 操作更新 `lastActiveTime`（`internal/session/memory/provider.go:56-87`）
-5. Remember Me 用户的普通授权请求不更新 `LastActivity`（`internal/handlers/handler_authz_authn.go:477`：`if !userSession.KeepMeLoggedIn`）
+**审计建议**：
+- 密码重置成功后，应主动销毁该用户的所有现有会话
+- 可通过存储层查询该用户的所有会话并逐个销毁，或引入会话黑名单机制
+- 参考登录流程的会话销毁逻辑：`internal/handlers/handler_firstfactor_password.go:101`
 
-**攻击场景**（基于代码级证据）：
-1. 用户在记住登录状态（Remember Me）下完成密码重置身份验证 → Identity Finish 调用 SaveSession 刷新 `lastActiveTime`（`handler_reset_password.go:283`）
+#### 风险 3：PasswordResetUsername 无独立过期时间，可被不当延长（可审计表述）
+
+**风险陈述**：`PasswordResetUsername` 标志位无独立过期时间，仅与会话 cookie 过期时间绑定。在特定条件下，可通过触发 SaveSession 调用延长密码重置的有效窗口。
+
+**代码级事实确认（逐条对账）**：
+
+| 事实陈述 | 真伪 | 代码依据 |
+|---------|------|---------|
+| `PasswordResetUsername` 受 Inactivity（5 分钟）超时限制 | ❌ 伪 | 密码重置流程调用 `GetSession()` 读取会话，该方法仅检查 cookie 域匹配，不检查 Inactivity。Inactivity 检查仅在授权中间件（`/api/authz/*`）中执行。<br>`internal/middlewares/authelia_context.go:380-406` |
+| `PasswordResetUsername` 默认最多 1 小时窗口 | ⚠️ 部分真 | 未登录或未勾选 Remember Me 时，cookie Expiration = 1 小时；勾选 Remember Me 时，cookie Expiration = 30 天。<br>`internal/handlers/handler_firstfactor_password.go:124-128` |
+| 可通过用户持续活动无限刷新窗口 | ❌ 伪 | 只有触发 SaveSession 调用的活动才能刷新 provider 层 `lastActiveTime`。刷新不能超过 cookie 的绝对过期时间（浏览器强制）。<br>`internal/session/memory/provider.go:56-68`（Save 更新 `lastActiveTime`） |
+| Remember Me 用户可"无限续期" | ❌ 伪 | 需在 cookie Expiration 内（30 天）触发 SaveSession 调用，且延长后的过期时间不能超过 cookie 的绝对过期时间。<br>`internal/handlers/handler_authz_authn.go:477`（Remember Me 用户不更新 `LastActivity`） |
+
+**过期行为的精确边界（代码可验证）**：
+
+1. **过期条件**：`PasswordResetUsername` 仅在以下情况过期：
+   - 存储层 GC 回收：`now >= lastActiveTime + expiration`（Memory Provider）或 Redis 键 TTL 到期（Redis Provider）
+   - 密码重置成功：`ResetPasswordPOST` 将其设为 `nil`
+   - 会话销毁：登出、重新登录、cookie 域不匹配
+
+2. **窗口延长条件**（满足任一即可）：
+   - 调用 `SaveSession`：刷新 `lastActiveTime`（Memory）或重置键 TTL（Redis）
+   - 调用 `RegenerateSession`：重置会话 ID 并刷新过期时间
+
+3. **窗口不延长的边界**：
+   - 仅调用 `GetSession`：不修改 `lastActiveTime`，不刷新过期
+   - 访问静态页面：不调用后端 API，不操作会话
+   - Remember Me 用户的普通授权请求：不更新 `LastActivity`，不触发 SaveSession（除非 RefreshInterval 触发）
+
+**代码证据链（完整可回溯）**：
+1. `GetSession()` 不检查 Inactivity：`internal/middlewares/authelia_context.go:380-406`
+2. 代码作者明确标注设计限制："We can improve the security of this check by making the request expire at some point because here it only expires when the cookie expires." <br>`internal/handlers/handler_reset_password.go:146-148`
+3. Remember Me 场景下 cookie Expiration = 30 天：`internal/handlers/handler_firstfactor_password.go:124-128`
+4. 只有 Save/Regenerate 操作更新过期时间：
+   - Memory Provider：`internal/session/memory/provider.go:56-87`
+   - Redis Provider：`github.com/fasthttp/session/v2@v2.5.9/providers/redis/provider_base.go:24-48`
+5. Remember Me 用户的普通授权请求不更新 `LastActivity`：`internal/handlers/handler_authz_authn.go:477`
+
+**攻击场景（基于代码级证据）**：
+1. 用户在 Remember Me 状态下完成密码重置身份验证 → Identity Finish 调用 SaveSession 刷新过期时间<br>`internal/handlers/handler_reset_password.go:283`
 2. 攻击者窃取会话 cookie
-3. 攻击者需要在 30 天内**触发 SaveSession 调用**才能刷新窗口：
-   - 可通过访问授权端点（`/api/authz/*`）触发 RefreshInterval（`handler_authz_authn.go:534-538`）
-   - 或通过其他会修改会话的操作（如 2FA 认证、设备管理等）
-   - **注意**：`/api/state` 仅使用 middlewareAPI，不经过授权中间件，不会触发 RefreshInterval
-4. 即使不断刷新，也不能超过 cookie 的绝对过期时间（由浏览器强制）
-5. 攻击者可以在有效期内提交新密码
+3. 攻击者需在 30 天内触发 SaveSession 调用以延长窗口：
+   - 访问授权端点（`/api/authz/*`）触发 RefreshInterval（满足 `RefreshInterval > 0` 且时间间隔足够）<br>`internal/handlers/handler_authz_authn.go:534-538`
+   - 或执行其他修改会话的操作（2FA 认证、设备管理等）
+   - **边界**：`/api/state` 仅使用 middlewareAPI，不经过授权中间件，不会触发 RefreshInterval<br>`internal/server/handlers.go:220`
+4. 即使不断刷新，也不能超过 cookie 的绝对过期时间（浏览器强制）
+5. 攻击者可在有效期内提交新密码
 
-**代码依据**：
-- Identity Finish 触发 SaveSession：`handler_reset_password.go:283`
-- RefreshInterval 触发条件：`handler_authz_authn.go:534-538`
-- /api/state 中间件链：`internal/server/handlers.go:220`（仅 middlewareAPI）
+**审计建议**：
+- 为 `PasswordResetUsername` 添加独立过期时间戳字段（如 `PasswordResetExpiresAt`）
+- 在 `ResetPasswordPOST` 中检查独立过期时间，建议设置为 15-30 分钟
+- 独立过期时间不应被任何 SaveSession 调用刷新
+- 在 Identity Finish 阶段设置独立过期时间戳
 
-**建议**：
-- 为 `PasswordResetUsername` 添加独立的过期时间戳（如 `PasswordResetExpiresAt`），在 `ResetPasswordPOST` 中检查
-- 过期时间建议设置为 15-30 分钟，与 JWT 有效期匹配
-- 不允许通过任何活动刷新此独立过期时间
+---
 
-#### 风险 4：IP 不绑定于密码重置流程
+#### 风险 4：IP 不绑定于密码重置流程（可审计表述）
 
-与修改密码的 Session Elevation（绑定 RemoteIP）不同，密码重置流程**不验证** IP 一致性：
-- `IdentityVerification` 记录了 `issued_ip` 和 `consumed_ip`，但仅用于审计
-- 攻击者可以在不同 IP 使用截获的 JWT 完成验证
+**风险陈述**：与修改密码的 Session Elevation（绑定 RemoteIP）不同，密码重置流程不验证 IP 一致性。`IdentityVerification` 记录了 `issued_ip` 和 `consumed_ip`，但仅用于审计，不做强制校验。
 
-**影响**：由于 JWT 5 分钟内过期且一次性使用，实际风险较低。但如果 JWT 在有效期内被截获（如邮件被中间人读取），攻击者可在不同 IP 使用。
+**代码级证据**：
+1. `IdentityVerification` 表结构包含 `issued_ip` 和 `consumed_ip` 字段，用于记录但不验证：
+   - `issued_ip` 在 Identity Start 阶段记录：`internal/handlers/handler_reset_password.go:255`
+   - `consumed_at` 和 `consumed_ip` 在 Identity Finish 阶段记录：`internal/handlers/handler_reset_password.go:289`
+2. Identity Finish 阶段无 IP 一致性校验逻辑，仅验证 JWT 有效性和令牌状态（未消费、未撤销、未过期）：`internal/handlers/handler_reset_password.go:274-295`
+3. 对比：Session Elevation（修改密码）强制校验 IP 一致性<br>`internal/handlers/handler_session_elevation.go`
 
-#### 风险 5：JWT 密钥泄露
+**边界条件**：
+- JWT 有效期默认 5 分钟，降低了截获窗口
+- JWT 一次性使用，`consumed_at` 标记后不可重复使用
+- 实际风险取决于邮件传输的安全性（邮件是否可能被中间人读取）
 
-`identity_validation.reset_password.jwt_secret` 用于签署和验证所有密码重置 JWT。如果此密钥泄露：
-- 攻击者可以为任意用户伪造有效的密码重置令牌
-- 攻击者可以绕过整个身份验证流程
+**审计建议**：
+- 考虑增加 IP 一致性校验（`issued_ip` 必须与 `consumed_ip` 匹配）
+- 或增加异常 IP 检测逻辑，如跨地域访问时增加额外验证
 
-**建议**：确保 JWT Secret 的安全存储，定期轮换。
+---
+
+#### 风险 5：JWT 密钥泄露（可审计表述）
+
+**风险陈述**：`identity_validation.reset_password.jwt_secret` 用于签署和验证所有密码重置 JWT。如果此密钥泄露，攻击者可为任意用户伪造有效的密码重置令牌，绕过整个身份验证流程。
+
+**代码级证据**：
+1. JWT 签名密钥配置：`internal/configuration/schema/identity_validation.go`（`jwt_secret` 字段）
+2. JWT 签名逻辑：Identity Start 阶段使用密钥签署 JWT<br>`internal/handlers/handler_reset_password.go:237`
+3. JWT 验证逻辑：Identity Finish 阶段使用密钥验证 JWT 签名<br>`internal/handlers/handler_reset_password.go:282`
+4. 密钥泄露后果：攻击者可构造任意 `iat`、`exp`、`jti`、`username` 字段的 JWT，使用泄露的密钥签名，即可通过验证
+
+**边界条件**：
+- 密钥泄露为假设性风险，需结合实际部署环境评估
+- JWT 包含 `jti`（唯一令牌 ID），理论上可通过黑名单机制缓解，但当前实现仅依赖数据库 `consumed_at` 标记
+
+**审计建议**：
+- 确保 JWT Secret 的安全存储（使用密钥管理系统，避免硬编码）
+- 建立密钥轮换机制，定期更换 JWT 密钥
+- 考虑增加 JWT `jti` 黑名单机制，密钥泄露后可快速作废所有未消费令牌
 
 ### 12.3 与 Remember Me 的交互
 
