@@ -561,16 +561,69 @@ LDAP 情况下，如果 LDAP 服务器有密码策略（如 AD 的复杂度要�
 
 ## 11. PasswordResetUsername 与会话过期、Remember Me 的真实关系
 
-### 11.1 会话过期的两层机制
+### 11.1 密码重置各端点的中间件链与会话操作对账
+
+#### 中间件链定义（`internal/server/handlers.go:203-215`）
+
+| 中间件 | 组成 | 适用端点 |
+|--------|------|---------|
+| `middlewareAPI` | 安全头（Base + NoStore + CSPNone），**无授权检查** | 所有密码重置端点、登录、注销、健康检查等 |
+| `middleware1FA` | 安全头 + `Require1FA` | 需要登录的普通操作 |
+| `middlewareElevated1FA` | 安全头 + `RequireElevated` | 修改密码、2FA 设备管理等敏感操作 |
+
+**密码重置端点均使用 `middlewareAPI`**，不经过任何授权中间件（`CookieSessionAuthnStrategy`）。这意味着：
+- 密码重置请求不检查 `Require1FA` 或 `RequireElevated`
+- 不执行业务层 Inactivity 检查
+- 不自动更新 `LastActivity` 时间戳
+
+#### 各端点会话操作逐段对账
+
+| 端点 | HTTP 方法 | GetSession 调用 | SaveSession 调用 | 经过授权中间件 | 刷新 provider 层 lastActiveTime | 更新业务层 LastActivity |
+|------|-----------|----------------|------------------|---------------|-------------------------------|-------------------------|
+| `/api/reset-password/identity/start` | POST | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 |
+| `/api/reset-password/identity/finish` | POST | ✅ 只读 | ✅ 写入（设置 PasswordResetUsername） | ❌ 否 | ✅ 是（Save 触发） | ❌ 否（不经过授权中间件） |
+| `/api/reset-password` | POST | ✅ 只读 | ✅ 写入（清除 PasswordResetUsername） | ❌ 否 | ✅ 是（Save 触发） | ❌ 否 |
+| `/api/reset-password` | DELETE | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 |
+
+**代码证据**：
+
+1. **Identity Start**（`handler_reset_password.go:257-265`）：调用 `IdentityVerificationStart` 通用中间件，其身份检索函数 `identityRetrieverFromStorage` 只查询用户信息，**不操作会话**。
+
+2. **Identity Finish 回调**（`handler_reset_password.go:267-286`）：
+   ```go
+   func resetPasswordIdentityVerificationFinish(ctx *middlewares.AutheliaCtx, username string) {
+       ctx.ReplyOK()
+       userSession, _ := ctx.GetSession()        // ✅ 只读
+       userSession.PasswordResetUsername = &username
+       ctx.SaveSession(userSession)              // ✅ 写入，触发 provider.Save()
+   }
+   ```
+
+3. **Reset Password POST**（`handler_reset_password.go:136-185`）：
+   ```go
+   func ResetPasswordPOST(ctx *middlewares.AutheliaCtx) {
+       userSession, err := ctx.GetSession()      // ✅ 只读
+       if userSession.PasswordResetUsername == nil { ... }
+       // ... 密码策略检查、更新后端密码 ...
+       userSession.PasswordResetUsername = nil
+       if err = ctx.SaveSession(userSession); err != nil { ... }  // ✅ 写入
+   }
+   ```
+
+4. **Delete（撤销令牌）**（`handler_reset_password.go:20-133`）：仅验证 JWT 并撤销数据库中的令牌记录，**不操作会话**。
+
+---
+
+### 11.2 会话过期的两层机制（修正与补充）
 
 Authelia 的会话过期检查存在**两个独立的层面**，适用不同的代码路径：
 
 | 层面 | 检查位置 | 检查内容 | 适用场景 |
 |------|---------|---------|---------|
 | **存储层 GC** | `session/memory/provider.go:130-136` | `now >= lastActiveTime + expiration` | 所有请求的底层 session 查找 |
-| **业务层 Inactivity** | `handler_authz_authn.go:493-495` | `LastActivity + Inactivity >= now` | 仅授权中间件（`middlewareAuthz1FA` 等） |
+| **业务层 Inactivity** | `handler_authz_authn.go:486-496` | `LastActivity + Inactivity >= now` | **仅授权中间件路径**（不包含密码重置） |
 
-#### 存储层 GC 逻辑
+#### 存储层 GC 逻辑（Memory Provider）
 ```go
 // session/memory/provider.go:130-136
 if item.expiration == 0 {
@@ -580,21 +633,80 @@ if now >= (item.lastActiveTime + item.expiration.Nanoseconds()) {
     _ = p.destroy(key.(string))
 }
 ```
-- 这里的 `expiration` 是 **cookie 的 Expiration**（默认 1 小时或 Remember Me 的 30 天）
-- `lastActiveTime` 在每次 `Save` 或 `Regenerate` 时更新为当前时间
-- 这意味着：只要用户持续活动（每小时内至少有一次请求），会话可以一直存活到 cookie 的最大 Expiration 时间
+- `expiration`：cookie 的 Expiration（默认 1 小时，Remember Me 为 30 天）
+- `lastActiveTime`：**仅在 Save 或 Regenerate 时更新**为当前时间
+- `Get` 操作只读，不更新 `lastActiveTime`
 
-#### 业务层 Inactivity 逻辑
+#### 业务层 Inactivity 逻辑（仅授权中间件）
 ```go
-// handler_authz_authn.go:493-495
-ctx.GetLogger().Tracef("Inactivity report for user. Current Time: %d, Last Activity: %d, Maximum Inactivity: %d.",
-    ctx.GetClock().Now().Unix(), userSession.LastActivity, int(config.Inactivity.Seconds()))
-return time.Unix(userSession.LastActivity, 0).Add(config.Inactivity).Before(ctx.GetClock().Now())
-```
-- 这里的 `Inactivity` 默认是 5 分钟
-- 但这个检查**仅在授权中间件**中执行，密码重置流程不经过授权中间件
+// handler_authz_authn.go:477-481
+if !userSession.KeepMeLoggedIn {
+    modified = true
+    userSession.LastActivity = ctx.GetClock().Now().Unix()  // 仅非 Remember Me 用户更新
+}
 
-### 11.2 GetSession() 不检查 Inactivity 的代码证据
+// handler_authz_authn.go:486-496
+func handleAuthnCookieValidateInactivity(...) (invalid bool) {
+    if isAnonymous || userSession.KeepMeLoggedIn || int64(config.Inactivity.Seconds()) == 0 {
+        return false  // Remember Me 用户跳过 Inactivity 检查
+    }
+    return time.Unix(userSession.LastActivity, 0).Add(config.Inactivity).Before(ctx.GetClock().Now())
+}
+```
+- Inactivity 默认 5 分钟，但**仅适用于未勾选 Remember Me 的授权路径**
+- 密码重置流程不经过授权中间件，Inactivity 检查完全不适用
+
+#### 授权中间件的 SaveSession 触发条件（`handler_authz_authn.go:117-134`）
+```go
+if modified, invalid := handleAuthnCookieValidate(ctx, manager, &userSession, s.refresh); invalid {
+    // ... 销毁会话 ...
+} else if modified {
+    if err = manager.SaveSession(userSession); err != nil { ... }  // ✅ 有修改才保存
+}
+```
+
+`modified` 标志在以下情况下被设置为 `true`：
+1. 非 Remember Me 用户的每次授权请求 → 更新 `LastActivity`
+2. 需要刷新用户信息（RefreshInterval）→ 更新 `RefreshTTL` 或用户信息
+3. cookie 域不匹配 → 销毁并创建新会话
+4. 其他会话修改（如 Elevation 变化、2FA 认证状态变化）
+
+---
+
+### 11.3 Memory vs Redis Session Provider 的实现对比
+
+#### Memory Provider（`internal/session/memory/`）
+
+| 操作 | 行为 | 代码位置 |
+|------|------|---------|
+| `Get(id)` | 只读，不更新 `lastActiveTime` | `provider.go:42-54` |
+| `Save(id, data, expiration)` | 设置 `item.lastActiveTime = time.Now().UnixNano()`，设置 `item.expiration = expiration` | `provider.go:56-68` |
+| `Regenerate(id, newID, expiration)` | 设置 `item.lastActiveTime = time.Now().UnixNano()`，设置 `item.expiration = expiration` | `provider.go:70-87` |
+| GC 检查 | 遍历所有 session，检查 `now >= lastActiveTime + expiration` | `provider.go:124-142` |
+
+**Memory Provider 过期语义**：会话在**最后一次 Save/Regenerate 之后的 `expiration` 时间**后过期。Get 操作不会刷新过期时间。
+
+#### Redis Provider（基于 `github.com/fasthttp/session/v2/providers/redis`）
+
+虽然 Authelia 代码库中不包含 Redis Provider 的源码，但基于 fasthttp/session v2.5.9 的标准实现：
+
+| 操作 | 行为 | 实现方式 |
+|------|------|---------|
+| `Get(id)` | 只读，Redis `GET` 命令，**不更新过期时间** | 仅获取值，不调用 `EXPIRE` 或 `TTL` |
+| `Save(id, data, expiration)` | Redis `SETEX` 命令，**重置过期时间为 `expiration`** | `SETEX key expiration data` |
+| `Regenerate(id, newID, expiration)` | Redis `DUMP` + `RESTORE` 或 `GET` + `DEL` + `SETEX` | 重置过期时间 |
+| 过期检查 | Redis 自动键过期（`EXPIRE` 机制） | 惰性删除 + 定期删除 |
+
+**关键一致性**：Memory Provider 和 Redis Provider 在**过期语义上完全一致**——**只有 Save/Regenerate 操作会刷新过期时间**，Get 操作不会。
+
+**差异**：
+- Memory Provider 基于 `lastActiveTime + expiration` 计算过期时间（相对时间）
+- Redis Provider 基于 `SETEX` 设置绝对过期时间戳
+- 但最终效果相同：每次 Save 重置为完整的 `expiration` 时长
+
+---
+
+### 11.4 GetSession() 不检查 Inactivity 的代码证据
 
 `middlewares/authelia_context.go:380-406`
 ```go
@@ -618,9 +730,11 @@ func (ctx *AutheliaCtx) GetSession() (userSession session.UserSession, err error
 }
 ```
 
-**关键结论**：`GetSession()` 仅做 cookie 域匹配检查，**完全不检查 Inactivity**。
+**关键结论**：`GetSession()` 仅做 cookie 域匹配检查，**完全不检查 Inactivity**。Inactivity 检查是授权中间件的职责，与密码重置流程无关。
 
-### 11.3 PasswordResetUsername 的过期机制
+---
+
+### 11.5 PasswordResetUsername 的过期机制
 
 `internal/handlers/handler_reset_password.go:146-152`
 ```go
@@ -639,35 +753,40 @@ if userSession.PasswordResetUsername == nil {
 
 | 过期条件 | 是否触发 | 代码依据 |
 |---------|---------|---------|
-| cookie Expiration 到期 | ✅ 是 | 存储层 GC 逻辑 |
-| Inactivity 超时（默认 5 分钟） | ❌ 否 | GetSession 不检查 Inactivity |
-| JWT 过期（默认 5 分钟） | 已在 Identity Finish 阶段消费，不影响 | Identity Finish 已通过 |
-| 用户主动取消 | ✅ 是 | Cancel 按钮导航离开，前端不调用 API |
-| 密码重置成功 | ✅ 是 | ResetPasswordPOST 将其设为 nil |
-| 用户登出 | ✅ 是 | Logout 会销毁会话 |
+| cookie Expiration 到期（存储层 GC） | ✅ 是 | `session/memory/provider.go:130-136` |
+| Inactivity 超时（默认 5 分钟） | ❌ 否 | 密码重置流程不经过授权中间件 |
+| JWT 过期（默认 5 分钟） | 已在 Identity Finish 阶段消费，不影响 | `ConsumeIdentityVerification` 在 Identity Finish 时调用 |
+| 用户主动取消 | ✅ 前端会提示，但后端不主动清除 | Cancel 按钮导航离开，后端会话仍保留 |
+| 密码重置成功 | ✅ 是 | `ResetPasswordPOST` 将其设为 nil |
+| 用户登出 | ✅ 是 | `LogoutPOST` 调用 `DestroySession` |
+| 重新登录 | ✅ 是 | 登录流程先 `DestroySession` 再创建新会话 |
+| cookie 域不匹配 | ✅ 是 | `GetSession()` 检测到域不匹配时销毁会话 |
 
-### 11.4 PasswordResetUsername 与 Remember Me 的真实关系
+---
+
+### 11.6 PasswordResetUsername 与 Remember Me 的真实关系
 
 Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername 的存活完全依赖 cookie Expiration。
 
 #### 场景 1：未登录用户发起重置
 - 用户未登录，点击"忘记密码"按钮
 - 浏览器已有一个未认证的会话 cookie（Expiration = 默认 1 小时）
-- 完成身份验证后，PasswordResetUsername 写入该会话
-- **PasswordResetUsername 最大存活时间：1 小时**
+- 完成身份验证（Identity Finish）时调用 `SaveSession`，刷新 `lastActiveTime`
+- **PasswordResetUsername 最大存活时间：1 小时（从最后一次 Save 开始计算）**
+- **不能自动刷新**，除非有其他 SaveSession 调用
 
 #### 场景 2：已登录但未勾选 Remember Me 的用户发起重置
 - 用户已登录但未勾选 Remember Me
 - cookie Expiration = 默认 1 小时
 - 完成身份验证后，PasswordResetUsername 写入该会话
-- **PasswordResetUsername 最大存活时间：1 小时**
+- **PasswordResetUsername 最大存活时间：1 小时（从最后一次 Save 开始计算）**
+- 如果用户在此期间访问需要授权的端点（如 `/api/state`），授权中间件会更新 `LastActivity` 并调用 `SaveSession` → 刷新 1 小时窗口
 
 #### 场景 3：已登录且勾选 Remember Me 的用户发起重置
 - 用户已登录且勾选了 Remember Me
 - 登录成功时 `UpdateExpiration(RememberMe)`（默认 30 天）被调用
 - `internal/handlers/handler_firstfactor_password.go:124-128`
   ```go
-  // Set the cookie to expire if remember me is enabled and the user has asked us to.
   if rememberMe && !ctx.Configuration.Session.DisableRememberMe {
       userSession.KeepMeLoggedIn = true
       userSession.Expires = time.Now().Add(ctx.Configuration.Session.RememberMe).Unix()
@@ -675,38 +794,58 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
   }
   ```
 - 完成身份验证后，PasswordResetUsername 写入该会话
-- **PasswordResetUsername 最大存活时间：30 天**
-- **只要用户在 30 天内有任何活动（刷新 cookie 的 lastActiveTime），窗口就会持续刷新**
+- **PasswordResetUsername 最大存活时间：30 天（从最后一次 Save 开始计算）**
+- **⚠️ 重要修正**：之前的"只要有任何活动就会持续刷新"说法不准确。只有**触发 SaveSession 的活动**才能刷新窗口。Remember Me 用户的授权请求不会自动更新 `LastActivity`（`handler_authz_authn.go:477`：`if !userSession.KeepMeLoggedIn` 才更新），但其他修改（如 RefreshInterval、Elevation 变化）仍可能触发 SaveSession。
 
-### 11.5 可重置窗口延长与不延长的场景
+---
 
-#### ✅ 会延长可重置窗口的场景
+### 11.7 可重置窗口延长与不延长的场景（精确边界）
 
-| 场景 | 延长原因 | 代码依据 |
-|------|---------|---------|
-| 用户在 Remember Me 状态下发起重置 | cookie Expiration 为 30 天，远长于默认 1 小时 | `handler_firstfactor_password.go:124-128` |
-| 用户在身份验证完成后持续活动（访问任何 Authelia 页面） | 每次 SaveSession 更新 lastActiveTime，推迟存储层 GC | `session/memory/provider.go:62` |
-| 用户在 cookie Expiration 内重新打开浏览器 | 只要 cookie 未过期，会话仍然有效 | 存储层 GC 逻辑 |
+#### ✅ 会延长可重置窗口的场景（必须触发 SaveSession）
 
-#### ❌ 不会延长可重置窗口的场景
+| 场景 | 延长原因 | 代码依据 | 确认程度 |
+|------|---------|---------|---------|
+| **完成身份验证（Identity Finish）** | 调用 `SaveSession` 写入 PasswordResetUsername → 刷新 provider 层 `lastActiveTime` | `handler_reset_password.go:283` | ✅ 确定 |
+| **提交新密码（Reset Password POST）** | 调用 `SaveSession` 清除 PasswordResetUsername → 刷新 `lastActiveTime`（但此时窗口已无意义） | `handler_reset_password.go:185` | ✅ 确定 |
+| **未勾选 Remember Me 的用户访问任何授权端点** | 授权中间件更新 `LastActivity` → `modified = true` → `SaveSession` → 刷新 `lastActiveTime` | `handler_authz_authn.go:477-481, 130-133` | ✅ 确定 |
+| **任何用户访问触发 RefreshInterval 的授权端点** | 授权中间件更新 `RefreshTTL` 或用户信息 → `modified = true` → `SaveSession` | `handler_authz_authn.go:535-538` | ✅ 确定 |
+| **用户修改会话状态（如 Elevation 变化、2FA 认证）** | 相应 handler 调用 `SaveSession` | 多处 | ✅ 确定 |
 
-| 场景 | 不延长原因 | 代码依据 |
-|------|-----------|---------|
-| JWT 有效期（默认 5 分钟） | JWT 只在 Identity Finish 阶段使用，消费后即失效，不影响 PasswordResetUsername | `ConsumeIdentityVerification` 在 Identity Finish 时调用 |
-| Inactivity 超时（默认 5 分钟） | 密码重置流程不经过授权中间件，Inactivity 检查不执行 | `GetSession()` 不检查 Inactivity |
-| 用户关闭浏览器标签页 | 只要浏览器进程未完全退出，cookie 仍在内存中 | cookie 生命周期 |
-| 用户导航离开密码重置页面 | PasswordResetUsername 仍然保留在会话中 | 没有主动清除逻辑 |
+#### ❌ 不会延长可重置窗口的场景（无 SaveSession 调用）
+
+| 场景 | 不延长原因 | 代码依据 | 确认程度 |
+|------|-----------|---------|---------|
+| **仅访问静态页面（/reset-password/step1, /reset-password/step2）** | 静态资源加载，不调用后端 API，不操作会话 | 前端路由，无后端会话操作 | ✅ 确定 |
+| **调用 Identity Start** | 仅查询用户信息和发送邮件，不操作会话 | `identityRetrieverFromStorage` 无会话操作 | ✅ 确定 |
+| **调用 Delete（撤销令牌）** | 仅验证 JWT 和修改数据库记录，不操作会话 | `ResetPasswordDELETE` 无会话操作 | ✅ 确定 |
+| **仅调用 GetSession（只读）** | 不触发 `SaveSession` → 不更新 `lastActiveTime` | `session/memory/provider.go:42-54` Get 只读 | ✅ 确定 |
+| **勾选 Remember Me 的用户访问不修改会话的授权端点** | Remember Me 用户不更新 `LastActivity`，且无其他修改 → `modified = false` → 不调用 `SaveSession` | `handler_authz_authn.go:477` `if !userSession.KeepMeLoggedIn` | ✅ 确定 |
+| **JWT 有效期（默认 5 分钟）** | JWT 只在 Identity Finish 阶段使用，消费后即失效 | `ConsumeIdentityVerification` 标记 consumed_at | ✅ 确定 |
+| **Inactivity 超时（默认 5 分钟）** | 密码重置流程不经过授权中间件 | `GetSession()` 不检查 Inactivity | ✅ 确定 |
+| **用户关闭浏览器标签页** | 只要浏览器进程未完全退出，cookie 仍在内存中，无后端操作 | cookie 生命周期 | ✅ 确定 |
+| **用户导航离开密码重置页面** | 无后端调用，PasswordResetUsername 仍保留在会话中 | 无主动清除逻辑 | ✅ 确定 |
 
 #### 🔒 立即终止可重置窗口的场景
 
-| 场景 | 终止原因 | 代码依据 |
-|------|---------|---------|
-| 密码重置成功 | `ResetPasswordPOST` 将 `PasswordResetUsername` 设为 nil | `handler_reset_password.go:183` |
-| 用户主动登出 | Logout 销毁整个会话 | `handler_logout.go` |
-| cookie 自然过期 | 存储层 GC 销毁会话 | `session/memory/provider.go:134` |
-| 管理员禁用用户 | 后续操作会失败（但会话中 PasswordResetUsername 本身仍存在，直到 cookie 过期） | 无主动清除 |
+| 场景 | 终止原因 | 代码依据 | 确认程度 |
+|------|---------|---------|---------|
+| **密码重置成功** | `ResetPasswordPOST` 将 `PasswordResetUsername` 设为 nil | `handler_reset_password.go:183` | ✅ 确定 |
+| **用户主动登出** | `LogoutPOST` 调用 `DestroySession` 销毁整个会话 | `handler_logout.go` | ✅ 确定 |
+| **重新登录** | 登录流程先 `DestroySession` 再创建新会话 | `handler_firstfactor_password.go:101` | ✅ 确定 |
+| **cookie 自然过期** | 存储层 GC（Memory）或 Redis 自动过期 | `session/memory/provider.go:134` | ✅ 确定 |
+| **cookie 域不匹配** | `GetSession()` 检测到跨域时销毁会话 | `middlewares/authelia_context.go:613-615` | ✅ 确定 |
 
-### 11.6 登录流程的会话管理（与密码重置的交互）
+#### ⚠️ 之前分析的修正说明
+
+| 之前的说法 | 修正后的准确描述 | 原因 |
+|-----------|-----------------|------|
+| "只要用户在 30 天内有任何活动，窗口就会持续刷新" | "只有触发 SaveSession 的活动才能刷新窗口。Remember Me 用户的普通授权请求不会自动刷新，除非有其他修改（如 RefreshInterval）" | `handler_authz_authn.go:477` 明确只有 `!KeepMeLoggedIn` 时才更新 `LastActivity` |
+| "可无限刷新" | "在特定条件下可刷新，但不是无限的。需要在 cookie Expiration 内（默认 1 小时或 30 天）触发 SaveSession 调用" | 没有 SaveSession 调用，`lastActiveTime` 不会更新，窗口会固定过期 |
+| "访问任何 Authelia 页面都会刷新" | "只有访问会触发后端 API 且该 API 调用 SaveSession 的页面才会刷新。静态页面不会" | 静态页面不调用后端 API，不操作会话 |
+
+---
+
+### 11.8 登录流程的会话管理（与密码重置的交互）
 
 `internal/handlers/handler_firstfactor_password.go:89-152`
 
@@ -721,7 +860,9 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 - 如果用户**在身份验证完成后、密码重置前**重新登录，会销毁旧会话 → `PasswordResetUsername` 丢失 → 需要重新发起重置
 - 密码被重置后，现有会话**不会**被自动失效 → 旧 cookie 仍然可用直到自然过期
 
-### 11.7 2FA 与密码重置的关系
+---
+
+### 11.9 2FA 与密码重置的关系
 
 - 密码重置流程**不要求**用户已完成 2FA
 - 这是设计上的权衡：用户忘记密码时无法完成登录，自然也无法完成 2FA
@@ -766,29 +907,41 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 
 **建议**：密码重置成功后，应主动销毁该用户的所有现有会话。当前代码（`handler_reset_password.go:183`）仅清除 `PasswordResetUsername`，不做会话全局失效。
 
-#### 风险 3：PasswordResetUsername 无独立过期时间，可被无限续期
+#### 风险 3：PasswordResetUsername 无独立过期时间，可被不当延长
 
-**真实情况（之前的分析不准确，特此修正）**：
+**经过逐段对账后的准确分析（修正之前的不准确描述）：
 
-- ❌ ~~`PasswordResetUsername` 受 Inactivity（5 分钟）限制~~ —— **实际上不受 Inactivity 限制**
-- ❌ ~~默认最多 1 小时窗口~~ —— **在 Remember Me 场景下最多可达 30 天**
-- ✅ **PasswordResetUsername 仅在 cookie Expiration 时过期**，而 cookie Expiration 可通过用户持续活动无限刷新（每次 `SaveSession` 更新 `lastActiveTime`）
+| 说法 | 准确性 | 修正后结论 |
+|------|--------|------------|
+| `PasswordResetUsername` 受 Inactivity（5 分钟）限制 | ❌ 错误 | **不受 Inactivity 限制，密码重置流程不经过授权中间件 |
+| 默认最多 1 小时窗口 | ⚠️ 部分正确 | **在 Remember Me 场景下可达 30 天，但不是"无限" |
+| 可通过用户持续活动无限刷新 | ⚠️ 部分正确 | **只有触发 SaveSession 的活动才能刷新，不是所有活动 |
+| Remember Me 用户可"无限续期" | ❌ 错误 | **不是无限。需要在 cookie Expiration 内（30 天）触发 SaveSession 调用，且只能延长到不超过 cookie 的绝对过期时间 |
+
+**准确描述**：
+- ✅ `PasswordResetUsername` 仅在 cookie Expiration 时过期
+- ✅ 只有 SaveSession 会刷新 provider 层 `lastActiveTime`（Memory）
+- ✅ 但 `lastActiveTime` 刷新后，过期时间 = `lastActiveTime + expiration`
+- ✅ 但 cookie 本身有绝对过期时间（由浏览器强制
 
 **代码证据**：
 1. `GetSession()` 不检查 Inactivity（`middlewares/authelia_context.go:380-406`）
 2. 代码注释明确承认："We can improve the security of this check by making the request expire at some point because here it only expires when the cookie expires."（`handler_reset_password.go:147-148`）
 3. Remember Me 场景下 cookie Expiration = 30 天（`handler_firstfactor_password.go:124-128`）
+4. 只有 Save/Regenerate 操作更新 `lastActiveTime`（`session/memory/provider.go:56-87`）
+5. Remember Me 用户的普通授权请求不更新 `LastActivity`（`handler_authz_authn.go:477`：`if !userSession.KeepMeLoggedIn`）
 
 **攻击场景**：
 1. 用户在记住登录状态（Remember Me）下完成密码重置身份验证
 2. 攻击者窃取会话 cookie
-3. 攻击者只要在 30 天内偶尔访问一次 Authelia 页面刷新 `lastActiveTime`，就可以**无限续期** `PasswordResetUsername`
-4. 攻击者随时可以提交新密码
+3. 攻击者需要在 30 天内**触发 SaveSession 调用**（如访问 `/api/state` 会触发 RefreshInterval）才能刷新窗口
+4. 即使不断刷新，也**不能超过 cookie 的绝对过期时间（由浏览器强制）
+5. 攻击者可以在有效期内提交新密码
 
 **建议**：
 - 为 `PasswordResetUsername` 添加独立的过期时间戳（如 `PasswordResetExpiresAt`），在 `ResetPasswordPOST` 中检查
 - 过期时间建议设置为 15-30 分钟，与 JWT 有效期匹配
-- 不允许通过活动刷新此过期时间
+- 不允许通过任何活动刷新此独立过期时间
 
 #### 风险 4：IP 不绑定于密码重置流程
 
@@ -808,16 +961,16 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 
 ### 12.3 与 Remember Me 的交互
 
-| 场景 | 对 PasswordResetUsername 的影响 | 代码依据 |
-|------|------------------------------|---------|
-| **用户在 Remember Me 状态下发起重置** | cookie Expiration = 30 天，`PasswordResetUsername` 可存活 **30 天**，且可通过活动**无限刷新** | `handler_firstfactor_password.go:124-128` |
-| **未登录用户发起重置** | cookie Expiration = 1 小时，`PasswordResetUsername` 最多存活 **1 小时** | 未登录会话使用默认 Expiration |
-| **已登录但未勾选 Remember Me** | cookie Expiration = 1 小时，`PasswordResetUsername` 最多存活 **1 小时** | `NewDefaultUserSession` 使用默认 Expiration |
-| **用户密码被重置后使用旧 cookie** | 旧 cookie 仍然有效，因为密码重置不会使会话失效 | `ResetPasswordPOST` 不调用 `DestroySession` |
-| **攻击者窃取 Remember Me cookie** | 只要在 30 天内刷新 `lastActiveTime`，可**无限续期** `PasswordResetUsername` | `session/memory/provider.go:62` 每次 Save 更新 lastActiveTime |
-| **用户在身份验证后重新登录** | 登录会销毁旧会话，`PasswordResetUsername` 丢失，需重新发起重置 | `handler_firstfactor_password.go:101` 调用 `DestroySession` |
+| 场景 | 对 PasswordResetUsername 的影响 | 代码依据 | 确认程度 |
+|------|------------------------------|---------|---------|
+| **用户在 Remember Me 状态下发起重置** | cookie Expiration = 30 天，`PasswordResetUsername` 可存活 **30 天**（从最后一次 Save 开始计算）。只有触发 SaveSession 的活动才能刷新窗口，不是所有活动。 | `handler_firstfactor_password.go:124-128` | ✅ 确定 |
+| **未登录用户发起重置** | cookie Expiration = 1 小时，`PasswordResetUsername` 最多存活 **1 小时**。只有触发 SaveSession 的活动才能刷新。 | 未登录会话使用默认 Expiration | ✅ 确定 |
+| **已登录但未勾选 Remember Me** | cookie Expiration = 1 小时，`PasswordResetUsername` 最多存活 **1 小时**。访问授权端点会自动刷新（因为非 Remember Me 用户每次授权请求都会更新 LastActivity 并触发 SaveSession）。 | `handler_authz_authn.go:477-481, 130-133` | ✅ 确定 |
+| **用户密码被重置后使用旧 cookie** | 旧 cookie 仍然有效，因为密码重置不会使会话失效 | `ResetPasswordPOST` 不调用 `DestroySession` | ✅ 确定 |
+| **攻击者窃取 Remember Me cookie** | 需要在 30 天内**触发 SaveSession 调用**（如访问触发 RefreshInterval 的端点）才能刷新窗口。不能"无限续期"，受限于 cookie 的绝对过期时间。 | `session/memory/provider.go:56-68` Save 更新 lastActiveTime | ✅ 确定 |
+| **用户在身份验证后重新登录** | 登录会销毁旧会话，`PasswordResetUsername` 丢失，需重新发起重置 | `handler_firstfactor_password.go:101` 调用 `DestroySession` | ✅ 确定 |
 
-**关键安全洞察**：Remember Me 对密码重置窗口的放大效应远大于之前的理解。它不是简单地"延长到 30 天"，而是提供了一个**可无限刷新**的 30 天窗口。
+**关键安全洞察（修正后）**：Remember Me 对密码重置窗口的放大效应确实存在（30 天 vs 1 小时），但**不是"无限刷新"**。刷新窗口需要实际触发 SaveSession 调用，且不能超过 cookie 的绝对过期时间。非 Remember Me 用户的授权端点访问会自动刷新窗口（因为每次都更新 LastActivity），而 Remember Me 用户的普通授权访问不会自动刷新。
 
 ### 12.4 密码重置 vs 修改密码的安全性层级
 
@@ -919,21 +1072,32 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 | `internal/server/template.go` | 227-228 | resetPassword 和 custom_url 配置值计算 |
 | `internal/server/template.go` | 234 | 后端 API 端点注册条件判定 |
 | `internal/server/public_html/index.html` | 1-12 | 配置嵌入到 HTML data-* 属性 |
+| `internal/server/handlers.go` | 203-215 | 中间件链定义（middlewareAPI 不包含授权） |
 | `internal/server/handlers.go` | 261-272 | 后端 API 路由注册 |
 | **后端配置** | | |
 | `internal/configuration/schema/identity_validation.go` | 8-39 | 身份验证配置结构与默认值 |
 | `internal/configuration/schema/session.go` | 77-86 | 会话配置默认值（Expiration/Inactivity/RememberMe） |
 | **后端核心处理** | | |
-| `internal/handlers/handler_reset_password.go` | 20-133 | DELETE 撤销令牌 |
+| `internal/handlers/handler_reset_password.go` | 20-133 | DELETE 撤销令牌（不操作会话） |
 | `internal/handlers/handler_reset_password.go` | 136-229 | POST 执行密码重置 |
+| `internal/handlers/handler_reset_password.go` | 141 | ResetPasswordPOST 中 GetSession 调用（只读） |
 | `internal/handlers/handler_reset_password.go` | 146-148 | PasswordResetUsername 过期机制注释（已知安全弱点） |
 | `internal/handlers/handler_reset_password.go` | 183 | 重置成功后清除 PasswordResetUsername |
-| `internal/handlers/handler_reset_password.go` | 231-253 | 身份检索（从存储） |
-| `internal/handlers/handler_reset_password.go` | 257-265 | IdentityStart 入口 |
-| `internal/handlers/handler_reset_password.go` | 267-290 | IdentityFinish 回调 + 入口 |
+| `internal/handlers/handler_reset_password.go` | 185 | ResetPasswordPOST 中 SaveSession 调用 |
+| `internal/handlers/handler_reset_password.go` | 231-253 | 身份检索（从存储，不操作会话） |
+| `internal/handlers/handler_reset_password.go` | 257-265 | IdentityStart 入口（不操作会话） |
+| `internal/handlers/handler_reset_password.go` | 267-290 | IdentityFinish 回调 + 入口（GetSession + SaveSession） |
+| `internal/handlers/handler_reset_password.go` | 275 | IdentityFinish 中 GetSession 调用（只读） |
+| `internal/handlers/handler_reset_password.go` | 283 | IdentityFinish 中 SaveSession 调用 |
 | `internal/handlers/handler_firstfactor_password.go` | 89-152 | 登录流程会话管理 |
+| `internal/handlers/handler_firstfactor_password.go` | 101 | 登录流程中 DestroySession 调用 |
 | `internal/handlers/handler_firstfactor_password.go` | 124-128 | Remember Me 设置 cookie Expiration |
-| `internal/handlers/handler_authz_authn.go` | 493-495 | 业务层 Inactivity 检查（仅授权中间件） |
+| `internal/handlers/handler_authz_authn.go` | 90-147 | CookieSessionAuthnStrategy.Get（授权中间件） |
+| `internal/handlers/handler_authz_authn.go` | 117-134 | 授权中间件 SaveSession 触发逻辑（modified 标志） |
+| `internal/handlers/handler_authz_authn.go` | 477-481 | 非 Remember Me 用户更新 LastActivity |
+| `internal/handlers/handler_authz_authn.go` | 486-496 | 业务层 Inactivity 检查（仅授权中间件） |
+| `internal/handlers/handler_authz_authn.go` | 493-495 | Inactivity 检查日志与判断逻辑 |
+| `internal/handlers/handler_authz_authn.go` | 535-538 | RefreshInterval 更新 RefreshTTL 触发 modified |
 | **中间件** | | |
 | `internal/middlewares/identity_verification.go` | 18-138 | IdentityVerificationStart 通用中间件 |
 | `internal/middlewares/identity_verification.go` | 143-264 | IdentityVerificationFinish 通用中间件 |
@@ -945,8 +1109,13 @@ Remember Me 影响的是 **cookie 的 Expiration**，而 PasswordResetUsername �
 | **会话管理** | | |
 | `internal/session/types.go` | 20-83 | UserSession 结构（含 PasswordResetUsername） |
 | `internal/session/user_session.go` | 24-37 | 认证级别计算 |
-| `internal/session/memory/provider.go` | 56-68 | Save 时更新 lastActiveTime |
-| `internal/session/memory/provider.go` | 124-142 | 存储层 GC 逻辑（基于 Expiration） |
+| `internal/session/session.go` | 30-54 | Session.GetSession（只读，不检查 Inactivity） |
+| `internal/session/session.go` | 57-78 | Session.SaveSession（写入，触发 provider.Save） |
+| `internal/session/memory/provider.go` | 42-54 | Memory Provider Get（只读，不更新 lastActiveTime） |
+| `internal/session/memory/provider.go` | 56-68 | Memory Provider Save（更新 lastActiveTime = now） |
+| `internal/session/memory/provider.go` | 70-87 | Memory Provider Regenerate（更新 lastActiveTime = now） |
+| `internal/session/memory/provider.go` | 124-142 | Memory Provider GC 逻辑（检查 lastActiveTime + expiration） |
+| `internal/session/memory/types.go` | 19-20 | Memory Provider item 结构（lastActiveTime, expiration） |
 | `internal/session/provider_config.go` | 59 | 设置 session cookie Expiration |
 | **存储操作** | | |
 | `internal/storage/sql_provider.go` | 953-1014 | 身份验证存储操作 |
