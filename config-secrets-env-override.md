@@ -696,7 +696,369 @@ storage:
       minimum_version: TLS1.2
 ```
 
-### 5.9 废弃键的 Secrets 处理路径
+---
+
+## 5.9 OIDC JWKS 数组安全实施路径
+
+### 5.9.1 旧键与新键的 *_FILE 支持差异
+
+OIDC 签名密钥配置经历了从单键到 JWKS 数组的架构演进，这导致了 `*_FILE` 支持能力的显著差异：
+
+| 配置键 | 结构类型 | `IsSecretKey()` | 支持 `*_FILE` | 状态 |
+|--------|---------|----------------|--------------|------|
+| `identity_providers.oidc.issuer_private_key` | 单值字段 | true | ✅ 支持 | 已废弃（deprecated） |
+| `identity_providers.oidc.issuer_certificate_chain` | 单值字段 | true | ✅ 支持 | 已废弃（deprecated） |
+| `identity_providers.oidc.jwks[].key` | 数组项 | false | ❌ 不支持 | 新标准方式 |
+| `identity_providers.oidc.jwks[].certificate_chain` | 数组项 | false | ❌ 不支持 | 新标准方式 |
+| `identity_providers.oidc.clients[].client_secret` | 数组项 | false | ❌ 不支持 | 活跃配置 |
+| `identity_providers.oidc.clients[].jwks[].key` | 数组项 | false | ❌ 不支持 | 活跃配置 |
+
+**根本原因**：`IsSecretKey()` 函数在 `helpers.go:148` 中明确排除包含 `[]` 的配置键：
+```go
+if strings.Contains(key, "[]") {
+    return false  // 数组项不支持 *_FILE
+}
+```
+
+**迁移风险**：
+- 旧键 `issuer_private_key` 可直接使用 `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE`
+- 迁移到新键 `jwks[].key` 后，上述环境变量失效
+- 若未提前准备替代方案，会导致私钥明文暴露在 YAML 中
+
+---
+
+### 5.9.2 基于模板过滤器的安全解决方案
+
+Authelia 提供了 `template` 配置过滤器，结合专用的模板函数，可以在不将私钥明文写入 YAML 的情况下安全配置 JWKS 数组。
+
+#### 核心模板函数
+
+| 函数 | 用途 | 代码引用 |
+|------|------|---------|
+| `secret(path)` | 读取文件内容，自动移除末尾 `\n`（与 `loadSecret()` 行为一致） | `templates/funcs.go:510-516` |
+| `fileContent(path)` | 读取文件原始内容，保留所有字符 | `templates/funcs.go:499-507` |
+| `mindent(indent, char, value)` | 多行 YAML 缩进，自动添加 `\|` 等多行标记 | `templates/funcs.go:485-491` |
+| `nindent(indent, value)` | 换行后缩进（先加换行，再加缩进） | `templates/funcs.go:478-480` |
+| `msquote(value)` | 多行字符串双引号引用 | `templates/funcs.go:291-310` |
+| `env(name)` | 读取环境变量 | `templates/funcs.go` |
+| `mustEnv(name)` | 读取环境变量，不存在则报错 | `templates/funcs.go` |
+
+#### 启用条件
+
+**方式 1：命令行参数**
+```bash
+authelia --config.experimental.filters=template --config /etc/authelia/config.yml
+```
+
+**方式 2：环境变量**
+```bash
+export X_AUTHELIA_CONFIG_FILTERS=template
+authelia --config /etc/authelia/config.yml
+```
+
+**注意事项**：
+- 过滤器仅对 YAML 文件生效，不对环境变量和 Secrets 文件生效
+- 模板处理在 YAML 解析之前执行
+- 若命令行指定了过滤器，环境变量会被忽略
+- 生产环境禁用 `trace` 级日志（会输出 base64 编码的处理后内容）
+
+---
+
+### 5.9.3 完整配置示例
+
+#### 场景 1：单 JWK 密钥配置
+
+**目录结构**：
+```
+/etc/authelia/
+├── config.yml              # 主配置文件（不含明文密钥）
+└── secrets/
+    ├── oidc-signing-key.pem
+    ├── oidc-signing-cert.pem
+    └── oidc-hmac-secret
+```
+
+**`config.yml` 配置**：
+```yaml
+identity_providers:
+  oidc:
+    hmac_secret: '{{ secret "/etc/authelia/secrets/oidc-hmac-secret" }}'
+    
+    jwks:
+      - key_id: signing-key-001
+        algorithm: RS256
+        use: sig
+        key: '{{ secret "/etc/authelia/secrets/oidc-signing-key.pem" | mindent 10 "|" | msquote }}'
+        certificate_chain: '{{ secret "/etc/authelia/secrets/oidc-signing-cert.pem" | mindent 10 "|" | msquote }}'
+    
+    cors:
+      allowed_origins:
+        - 'https://app.{{ mustEnv "ROOT_DOMAIN" }}'
+    
+    clients:
+      - client_id: myapp
+        client_secret: '{{ secret "/etc/authelia/secrets/oidc-client-myapp-secret" }}'
+        scopes:
+          - openid
+          - profile
+          - email
+```
+
+**模板函数解析流程**：
+1. `secret("/etc/authelia/secrets/oidc-signing-key.pem")` → 读取 PEM 内容，移除末尾 `\n`
+2. `mindent 10 "|"` → 检测到多行内容，添加 `|\n` 前缀，每行缩进 10 个空格
+3. `msquote` → 多行内容用双引号包裹（确保 YAML 正确解析）
+
+**处理后输出**：
+```yaml
+key: "|\n          -----BEGIN RSA PRIVATE KEY-----\n          MIIEpQIBAAKCAQEAs5BZdREjkceDvty5c+qBski4XXiMubVyGFLazoNumhMbgjA7\n          ...\n          -----END RSA PRIVATE KEY-----"
+```
+
+---
+
+#### 场景 2：多 JWK 密钥轮转配置
+
+**目录结构**：
+```
+/etc/authelia/
+├── config.yml
+└── secrets/
+    ├── oidc-signing-key-001.pem    # 旧密钥（仅验证）
+    ├── oidc-signing-key-002.pem    # 新密钥（用于签名）
+    ├── oidc-signing-cert-001.pem
+    └── oidc-signing-cert-002.pem
+```
+
+**`config.yml` 配置**：
+```yaml
+identity_providers:
+  oidc:
+    jwks:
+      # 新密钥（Key ID 用于标识，用于签名）
+      - key_id: signing-key-002
+        algorithm: RS256
+        use: sig
+        key: '{{ secret "/etc/authelia/secrets/oidc-signing-key-002.pem" | mindent 10 "|" | msquote }}'
+        certificate_chain: '{{ secret "/etc/authelia/secrets/oidc-signing-cert-002.pem" | mindent 10 "|" | msquote }}'
+      
+      # 旧密钥（保留用于验证已签发的 token）
+      - key_id: signing-key-001
+        algorithm: RS256
+        use: sig
+        key: '{{ secret "/etc/authelia/secrets/oidc-signing-key-001.pem" | mindent 10 "|" | msquote }}'
+        certificate_chain: '{{ secret "/etc/authelia/secrets/oidc-signing-cert-001.pem" | mindent 10 "|" | msquote }}'
+```
+
+---
+
+#### 场景 3：结合环境变量的动态配置
+
+```yaml
+identity_providers:
+  oidc:
+    jwks:
+      - key_id: '{{ mustEnv "OIDC_KID" }}'
+        algorithm: '{{ env "OIDC_ALG" | default "RS256" }}'
+        key: '{{ secret (mustEnv "OIDC_KEY_PATH") | mindent 10 "|" | msquote }}'
+        certificate_chain: '{{ secret (mustEnv "OIDC_CERT_PATH") | mindent 10 "|" | msquote }}'
+```
+
+---
+
+### 5.9.4 潜在风险及规避措施
+
+| 风险类型 | 风险描述 | 规避措施 |
+|---------|---------|---------|
+| **模板语法错误** | 模板语法错误导致配置解析失败，Authelia 无法启动 | 1. 先在测试环境验证模板<br>2. 使用 `authelia config validate --config.experimental.filters=template` 预校验<br>3. 保留回退配置 |
+| **Trace 日志泄露** | Trace 级别日志会输出 base64 编码的处理后配置内容 | 1. 生产环境日志级别设为 `info` 或更高<br>2. 日志文件权限设为 `0600`<br>3. 避免将日志输出到标准输出（容器环境需注意） |
+| **文件读取失败** | Secret 文件不存在或权限不足导致启动失败 | 1. 启动前检查文件权限和存在性<br>2. 使用 `mustEnv` 强制检查必需的环境变量<br>3. 实现健康检查和自动重启策略 |
+| **CRLF 换行问题** | Windows 系统生成的密钥文件包含 `\r\n`，`secret()` 只移除 `\n`，保留 `\r` | 1. 使用 `printf` 而非 `echo` 创建密钥文件<br>2. 用 `xxd` 验证文件内容<br>3. 必要时使用 `trim` 模板函数清理 |
+| **缩进错误** | `mindent` 参数不正确导致 YAML 结构错误 | 1. 根据实际缩进层级调整数字参数<br>2. 处理后验证 YAML 格式有效性<br>3. 参考测试配置 `config.filtered.yml:154` |
+| **过滤器未启用** | 忘记启用 `template` 过滤器，模板语法原样保留导致解析失败 | 1. 在启动脚本中强制指定过滤器<br>2. 使用配置管理工具（如 Ansible/Helm）确保一致性<br>3. 启动检查中验证过滤器状态 |
+
+---
+
+### 5.9.5 分步迁移指南
+
+#### 阶段 1：准备工作（无业务影响）
+
+1. **启用模板过滤器**（滚动重启，使用新的启动参数）：
+   ```bash
+   # 旧启动方式
+   authelia --config /etc/authelia/config.yml
+   
+   # 新启动方式（先启用过滤器，配置不变）
+   authelia --config.experimental.filters=template --config /etc/authelia/config.yml
+   ```
+
+2. **验证过滤器正常工作**：
+   - 检查启动日志，确认无模板相关错误
+   - 验证 OIDC 功能正常（测试登录流程）
+
+3. **准备 Secret 文件**：
+   - 将私钥导出为独立的 PEM 文件
+   - 设置文件权限为 `0400`，所有者为 authelia
+   - 验证文件内容（`xxd /path/to/key.pem | tail`）
+
+#### 阶段 2：并行配置（双写，无业务影响）
+
+1. **保留旧键配置**（继续使用 `*_FILE`）：
+   ```bash
+   export AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE=/etc/authelia/secrets/oidc-signing-key.pem
+   ```
+
+2. **添加新的 JWKS 配置**（使用模板函数）：
+   ```yaml
+   identity_providers:
+     oidc:
+       # 旧键继续生效（用于回退）
+       issuer_private_key: ''  # 留空，从 *_FILE 环境变量注入
+       
+       # 新 JWKS 配置
+       jwks:
+         - key_id: signing-key-001
+           algorithm: RS256
+           key: '{{ secret "/etc/authelia/secrets/oidc-signing-key.pem" | mindent 10 "|" | msquote }}'
+   ```
+
+3. **验证配置**：
+   ```bash
+   authelia config validate --config.experimental.filters=template --config /etc/authelia/config.yml
+   ```
+
+#### 阶段 3：切换到新配置（需要重启）
+
+1. **移除旧键的环境变量**：
+   ```bash
+   unset AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE
+   ```
+
+2. **从 YAML 中移除旧键配置**，只保留 JWKS 配置
+
+3. **滚动重启实例**，逐个验证：
+   - 验证 OIDC 发现端点 `/.well-known/openid-configuration`
+   - 验证 JWKS 端点 `/.well-known/jwks.json`
+   - 测试完整的登录和 Token 签发流程
+
+#### 阶段 4：清理（确认稳定后）
+
+1. 确认所有实例正常运行 24 小时以上
+2. 监控 Token 签发和验证成功率
+3. 备份旧配置后，删除旧的 `*_FILE` 环境变量配置
+4. 从密钥管理系统中移除旧密钥引用（如 Docker Secrets、K8s Secrets）
+
+---
+
+### 5.9.6 回退措施
+
+#### 紧急回退（5 分钟内完成）
+
+**场景**：新 JWKS 配置出现问题，需要快速回退到旧配置
+
+1. **恢复旧的环境变量**：
+   ```bash
+   export AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE=/etc/authelia/secrets/oidc-signing-key.pem
+   export AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_CERTIFICATE_CHAIN_FILE=/etc/authelia/secrets/oidc-signing-cert.pem
+   ```
+
+2. **禁用模板过滤器**（如怀疑模板导致问题）：
+   ```bash
+   # 移除 --config.experimental.filters=template 参数
+   authelia --config /etc/authelia/config.yml
+   ```
+
+3. **回滚配置文件**到上一个版本（Git/配置管理工具）
+
+4. **重启实例**，验证服务恢复
+
+#### 渐进式回退（无业务中断）
+
+1. 保持 JWKS 配置不变，重新添加旧键配置
+2. 恢复旧键的 `*_FILE` 环境变量
+3. 确认旧键和新 JWKS 同时生效（Authelia 会优先使用新配置，但旧键可作为备用）
+4. 逐步移除 JWKS 配置，确认旧键正常工作
+5. 最后移除模板过滤器
+
+---
+
+### 5.9.7 与 *_FILE 方式的对比
+
+| 对比项 | `*_FILE` 环境变量 | 模板 `secret()` 函数 |
+|--------|------------------|---------------------|
+| **支持数组项** | ❌ 不支持 | ✅ 支持 |
+| **配置灵活性** | 仅支持注入完整值 | 支持条件判断、循环、环境变量组合 |
+| **错误处理** | 文件不存在时输出清晰错误信息 | 模板解析错误信息较复杂 |
+| **冲突检测** | 与 YAML 配置冲突时报错 | 无冲突检测，模板值会覆盖 |
+| **日志泄露风险** | 无（仅在验证阶段处理） | Trace 级别会泄露 base64 内容 |
+| **启用条件** | 无需额外配置，默认支持 | 需要启用 `template` 过滤器 |
+| **换行处理** | `strings.TrimRight(content, "\n")` | `secret()` 同样处理，`fileContent()` 保留原始 |
+| **适用范围** | 仅支持通过 `IsSecretKey()` 的字段 | 支持所有 YAML 配置项 |
+| **学习成本** | 低 | 中（需要了解 Go 模板语法） |
+
+---
+
+### 5.9.8 其他不支持 *_FILE 的字段解决方案
+
+除了 OIDC JWKS 数组，还有以下数组项类型的敏感字段也可以使用相同的模板方案：
+
+| 配置键 | 解决方案 |
+|--------|---------|
+| `identity_providers.oidc.clients[].client_secret` | `client_secret: '{{ secret "/path/to/client-secret" }}'` |
+| `identity_providers.oidc.clients[].jwks[].key` | 与全局 jwks 相同的处理方式 |
+| `storage.postgres.servers[].tls.private_key` | `private_key: \|` + `{{ secret "/path/to/key.pem" \| nindent 8 }}` |
+| `session.redis.sentinel_password` | 非数组，可直接使用 `*_FILE` |
+
+---
+
+### 5.9.9 验证工具
+
+#### 1. 配置验证命令
+```bash
+# 验证模板语法和配置有效性
+authelia config validate \
+  --config.experimental.filters=template \
+  --config /etc/authelia/config.yml
+```
+
+#### 2. 手动渲染模板（调试用）
+```go
+// 简单的模板调试程序，可验证模板输出
+package main
+
+import (
+    "bytes"
+    "fmt"
+    "os"
+    "text/template"
+    
+    "github.com/authelia/authelia/v4/internal/templates"
+)
+
+func main() {
+    content, _ := os.ReadFile("/etc/authelia/config.yml")
+    
+    t := template.New("debug").Funcs(templates.FuncMap())
+    t, _ = t.Parse(string(content))
+    
+    var buf bytes.Buffer
+    t.Execute(&buf, nil)
+    
+    fmt.Println(buf.String())
+}
+```
+
+#### 3. YAML 语法验证
+```bash
+# 使用 yamllint 验证处理后的 YAML
+authelia config validate ... 2>&1 | head -100
+
+# 或使用 python 验证
+python3 -c "import yaml; yaml.safe_load(open('config-rendered.yml'))"
+```
+
+---
+
+## 5.10 废弃键的 Secrets 处理路径
 
 废弃键的 `_FILE` 环境变量通过 `getSecretConfigMap()` 的第二条遍历路径生效（`helpers.go:70-78`）：
 
@@ -1222,6 +1584,13 @@ session.name = "my_session"   # 来自环境变量
 | **PostgreSQL SSL 路径读取 | `internal/storage/sql_provider_backend_postgres.go` | 305-351 |
 | **PostgreSQL SSL key 读取 | `internal/storage/sql_provider_backend_postgres.go` | 328-348 |
 | **MySQL TLS 配置处理 | `internal/storage/sql_provider_backend_mysql.go` | 35-59 |
+| **模板函数库入口 | `internal/templates/funcs.go` | 30-112 |
+| **secret() 模板函数 | `internal/templates/funcs.go` | 510-516 |
+| **fileContent() 模板函数 | `internal/templates/funcs.go` | 499-507 |
+| **mindent() 多行缩进函数 | `internal/templates/funcs.go` | 485-491 |
+| **nindent() 换行缩进函数 | `internal/templates/funcs.go` | 478-480 |
+| **msquote() 多行引用函数 | `internal/templates/funcs.go` | 291-310 |
+| **模板过滤器示例配置 | `internal/configuration/test_resources/config.filtered.yml` | 1-172 |
 
 ---
 
@@ -1236,14 +1605,18 @@ Authelia 的配置系统设计得相当安全和灵活：
 5. **脱敏依赖开发者**：没有全局自动脱敏，需在代码中手动处理
 6. **Trace 日志风险**：生产环境禁用 Trace 级别，避免配置泄露
 7. **CRLF 风险**：Windows 换行可能导致密钥认证失败，需特别注意
-8. **数组项限制**：包含 `[]` 的配置项（如 OIDC 客户端密钥）不支持 Secrets 加载
+8. **数组项限制**：包含 `[]` 的配置项（如 OIDC 客户端密钥、JWKS）不支持 `*_FILE` 加载
+9. **模板过滤器方案**：对于不支持 `*_FILE` 的数组字段，可通过 `template` 过滤器 + `secret()` 函数实现安全加载
+10. **新旧键差异**：OIDC 从 `issuer_private_key`（支持 `*_FILE`）迁移到 `jwks[].key`（不支持 `*_FILE`）时需特别注意，建议采用分步迁移策略
 
 在将生产密钥从明文 YAML 中移除时，应：
 1. 对照第 5 章的敏感字段清单，识别所有需要迁移的字段
 2. 注意第 5.5 节的例外规则，某些字段不支持 Secrets 加载
-3. 为每个支持的敏感字段创建 Secrets 文件
-4. 按照第 6 章的指导正确创建 Secrets 文件，避免 CRLF 问题
-5. 设置对应的 `AUTHELIA_*_FILE` 环境变量
-6. 从 YAML 文件中删除敏感字段
-7. 滚动重启所有实例
-8. 验证配置是否正确加载（使用 `authelia config validate`）
+3. 对于数组类型的敏感字段（如 OIDC JWKS），参考第 5.9 节使用模板过滤器方案
+4. 为每个支持的敏感字段创建 Secrets 文件
+5. 按照第 6 章的指导正确创建 Secrets 文件，避免 CRLF 问题
+6. 对于支持 `*_FILE` 的字段，设置对应的 `AUTHELIA_*_FILE` 环境变量
+7. 对于不支持 `*_FILE` 的数组字段，启用 `template` 过滤器并使用 `secret()` 模板函数
+8. 从 YAML 文件中删除敏感字段
+9. 滚动重启所有实例
+10. 验证配置是否正确加载（使用 `authelia config validate --config.experimental.filters=template`）
