@@ -440,60 +440,65 @@ secretExclusionExact  = []string{
 | 模式排除 | 包含 `[]` 的键 | 数组项（如 `clients[].client_secret`）不支持 secrets |
 | 模式排除 | 包含 `.*.` 的键 | 通配符配置项不支持 secrets |
 
-### 5.4 核对方法
+### 5.4 路径型字段 vs 内容型字段：核心判定原则
 
-以下清单通过对 `schema/keys.go` 中全部 502 个配置键逐一应用 `IsSecretKey()` 规则生成，并同时检查 `deprecation.go` 中的废弃键映射。核对逻辑如下：
+在进行 Secrets 迁移前，必须区分两种完全不同的配置模式：
 
-1. 遍历 `schema.Keys` 列表（`keys.go:10-502`）中的每一个键
-2. 遍历 `deprecations` 映射（`deprecation.go:24-338`）中的每一个废弃键
-3. 对每个键依次检查 `IsSecretKey()` 的五条规则：
-   - 含 `[]` → 排除
-   - 含 `.*.` → 排除
-   - 精确匹配 `secretExclusionExact` → 排除
-   - 前缀匹配 `secretExclusionPrefix` → 排除
-   - 后缀匹配 `secretSuffix` → 纳入
-4. 通过 `getSecretConfigMap()` 确认 `*_FILE` 环境变量名
+| 类型 | 配置含义 | 支持 `*_FILE` | 正确迁移方式 | 示例字段 |
+|------|---------|--------------|-------------|----------|
+| **内容型字段** | 配置值就是密钥/密码**内容本身** | ✅ 支持 | 使用 `*_FILE` 环境变量指向包含内容的文件 | `storage.encryption_key`、`session.secret` |
+| **路径型字段** | 配置值是**文件路径字符串**，Authelia 自己读取文件 | ⚠️ 不建议 | 直接配置路径字符串，或挂载 secrets 文件 | `server.tls.key`、`storage.postgres.ssl.key` |
+
+**代码判定依据**：
+
+| 字段 | Schema 类型 | 实际读取方式 | 类型判定 |
+|------|------------|-------------|---------|
+| `*.tls.private_key` | `CryptographicPrivateKey` | 直接解析 PEM 内容 | 内容型 |
+| `*.tls.certificate_chain` | `X509CertificateChain` | 直接解析 PEM 内容 | 内容型 |
+| `server.tls.key` | `string` | 调用 `os.ReadFile(path)` | 路径型 |
+| `storage.postgres.ssl.key` | `string` | 调用 `os.ReadFile(path)` | 路径型 |
+
+**关键发现**：`storage.postgres.ssl.key` 虽然被 `IsSecretKey()` 识别为敏感字段（返回 `true`），但它实际上是**文件路径**，不是内容。用 `*_FILE` 注入会导致"路径的路径"问题。
 
 ### 5.5 可用 *_FILE 迁移的敏感字段完整清单
 
-> 以下清单共 **25 个字段**，按模块分组，含环境变量和 Secrets 环境变量的完整映射。
+> 以下清单共 **24 个内容型字段**，按模块分组，含环境变量和 Secrets 环境变量的完整映射。
 
-| # | 配置键 | 对应环境变量 | 对应 Secrets 环境变量 | 来源 |
-|---|--------|-------------|----------------------|------|
-| **认证后端 (LDAP)** | | | | |
-| 1 | `authentication_backend.ldap.password` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE` | keys.go |
-| 2 | `authentication_backend.ldap.tls.certificate_chain` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_CERTIFICATE_CHAIN_FILE` | keys.go |
-| 3 | `authentication_backend.ldap.tls.private_key` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_PRIVATE_KEY` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_PRIVATE_KEY_FILE` | keys.go |
-| **Duo API** | | | | |
-| 4 | `duo_api.integration_key` | `AUTHELIA_DUO_API_INTEGRATION_KEY` | `AUTHELIA_DUO_API_INTEGRATION_KEY_FILE` | keys.go |
-| 5 | `duo_api.secret_key` | `AUTHELIA_DUO_API_SECRET_KEY` | `AUTHELIA_DUO_API_SECRET_KEY_FILE` | keys.go |
-| **OIDC 身份提供者** | | | | |
-| 6 | `identity_providers.oidc.hmac_secret` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE` | keys.go |
-| 7 | `identity_providers.oidc.issuer_certificate_chain` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_CERTIFICATE_CHAIN` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_CERTIFICATE_CHAIN_FILE` | keys.go + deprecation.go |
-| 8 | `identity_providers.oidc.issuer_private_key` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE` | keys.go + deprecation.go |
-| **身份验证** | | | | |
-| 9 | `identity_validation.reset_password.jwt_secret` | `AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET` | `AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE` | keys.go |
-| **邮件通知 (SMTP)** | | | | |
-| 10 | `notifier.smtp.password` | `AUTHELIA_NOTIFIER_SMTP_PASSWORD` | `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE` | keys.go |
-| 11 | `notifier.smtp.tls.certificate_chain` | `AUTHELIA_NOTIFIER_SMTP_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_NOTIFIER_SMTP_TLS_CERTIFICATE_CHAIN_FILE` | keys.go |
-| 12 | `notifier.smtp.tls.private_key` | `AUTHELIA_NOTIFIER_SMTP_TLS_PRIVATE_KEY` | `AUTHELIA_NOTIFIER_SMTP_TLS_PRIVATE_KEY_FILE` | keys.go |
-| **会话管理** | | | | |
-| 13 | `session.secret` | `AUTHELIA_SESSION_SECRET` | `AUTHELIA_SESSION_SECRET_FILE` | keys.go |
-| 14 | `session.redis.password` | `AUTHELIA_SESSION_REDIS_PASSWORD` | `AUTHELIA_SESSION_REDIS_PASSWORD_FILE` | keys.go |
-| 15 | `session.redis.high_availability.sentinel_password` | `AUTHELIA_SESSION_REDIS_HIGH_AVAILABILITY_SENTINEL_PASSWORD` | `AUTHELIA_SESSION_REDIS_HIGH_AVAILABILITY_SENTINEL_PASSWORD_FILE` | keys.go |
-| 16 | `session.redis.tls.certificate_chain` | `AUTHELIA_SESSION_REDIS_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_SESSION_REDIS_TLS_CERTIFICATE_CHAIN_FILE` | keys.go |
-| 17 | `session.redis.tls.private_key` | `AUTHELIA_SESSION_REDIS_TLS_PRIVATE_KEY` | `AUTHELIA_SESSION_REDIS_TLS_PRIVATE_KEY_FILE` | keys.go |
-| **存储 (通用)** | | | | |
-| 18 | `storage.encryption_key` | `AUTHELIA_STORAGE_ENCRYPTION_KEY` | `AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE` | keys.go |
-| **存储 (MySQL)** | | | | |
-| 19 | `storage.mysql.password` | `AUTHELIA_STORAGE_MYSQL_PASSWORD` | `AUTHELIA_STORAGE_MYSQL_PASSWORD_FILE` | keys.go |
-| 20 | `storage.mysql.tls.certificate_chain` | `AUTHELIA_STORAGE_MYSQL_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_STORAGE_MYSQL_TLS_CERTIFICATE_CHAIN_FILE` | keys.go |
-| 21 | `storage.mysql.tls.private_key` | `AUTHELIA_STORAGE_MYSQL_TLS_PRIVATE_KEY` | `AUTHELIA_STORAGE_MYSQL_TLS_PRIVATE_KEY_FILE` | keys.go |
-| **存储 (PostgreSQL)** | | | | |
-| 22 | `storage.postgres.password` | `AUTHELIA_STORAGE_POSTGRES_PASSWORD` | `AUTHELIA_STORAGE_POSTGRES_PASSWORD_FILE` | keys.go |
-| 23 | `storage.postgres.ssl.key` | `AUTHELIA_STORAGE_POSTGRES_SSL_KEY` | `AUTHELIA_STORAGE_POSTGRES_SSL_KEY_FILE` | keys.go |
-| 24 | `storage.postgres.tls.certificate_chain` | `AUTHELIA_STORAGE_POSTGRES_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_STORAGE_POSTGRES_TLS_CERTIFICATE_CHAIN_FILE` | keys.go |
-| 25 | `storage.postgres.tls.private_key` | `AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY` | `AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY_FILE` | keys.go |
+| # | 配置键 | 对应环境变量 | 对应 Secrets 环境变量 | 字段类型 | 来源 |
+|---|--------|-------------|----------------------|---------|------|
+| **认证后端 (LDAP)** | | | | | |
+| 1 | `authentication_backend.ldap.password` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE` | 密码字符串 | keys.go |
+| 2 | `authentication_backend.ldap.tls.certificate_chain` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go |
+| 3 | `authentication_backend.ldap.tls.private_key` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_PRIVATE_KEY` | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_TLS_PRIVATE_KEY_FILE` | PEM 内容 | keys.go |
+| **Duo API** | | | | | |
+| 4 | `duo_api.integration_key` | `AUTHELIA_DUO_API_INTEGRATION_KEY` | `AUTHELIA_DUO_API_INTEGRATION_KEY_FILE` | API Key 字符串 | keys.go |
+| 5 | `duo_api.secret_key` | `AUTHELIA_DUO_API_SECRET_KEY` | `AUTHELIA_DUO_API_SECRET_KEY_FILE` | API Secret 字符串 | keys.go |
+| **OIDC 身份提供者** | | | | | |
+| 6 | `identity_providers.oidc.hmac_secret` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE` | HMAC 密钥 | keys.go |
+| 7 | `identity_providers.oidc.issuer_certificate_chain` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_CERTIFICATE_CHAIN` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go + deprecation.go |
+| 8 | `identity_providers.oidc.issuer_private_key` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY` | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_ISSUER_PRIVATE_KEY_FILE` | PEM 内容 | keys.go + deprecation.go |
+| **身份验证** | | | | | |
+| 9 | `identity_validation.reset_password.jwt_secret` | `AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET` | `AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE` | JWT 密钥 | keys.go |
+| **邮件通知 (SMTP)** | | | | | |
+| 10 | `notifier.smtp.password` | `AUTHELIA_NOTIFIER_SMTP_PASSWORD` | `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE` | 密码字符串 | keys.go |
+| 11 | `notifier.smtp.tls.certificate_chain` | `AUTHELIA_NOTIFIER_SMTP_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_NOTIFIER_SMTP_TLS_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go |
+| 12 | `notifier.smtp.tls.private_key` | `AUTHELIA_NOTIFIER_SMTP_TLS_PRIVATE_KEY` | `AUTHELIA_NOTIFIER_SMTP_TLS_PRIVATE_KEY_FILE` | PEM 内容 | keys.go |
+| **会话管理** | | | | | |
+| 13 | `session.secret` | `AUTHELIA_SESSION_SECRET` | `AUTHELIA_SESSION_SECRET_FILE` | Session 密钥 | keys.go |
+| 14 | `session.redis.password` | `AUTHELIA_SESSION_REDIS_PASSWORD` | `AUTHELIA_SESSION_REDIS_PASSWORD_FILE` | Redis 密码 | keys.go |
+| 15 | `session.redis.high_availability.sentinel_password` | `AUTHELIA_SESSION_REDIS_HIGH_AVAILABILITY_SENTINEL_PASSWORD` | `AUTHELIA_SESSION_REDIS_HIGH_AVAILABILITY_SENTINEL_PASSWORD_FILE` | Sentinel 密码 | keys.go |
+| 16 | `session.redis.tls.certificate_chain` | `AUTHELIA_SESSION_REDIS_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_SESSION_REDIS_TLS_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go |
+| 17 | `session.redis.tls.private_key` | `AUTHELIA_SESSION_REDIS_TLS_PRIVATE_KEY` | `AUTHELIA_SESSION_REDIS_TLS_PRIVATE_KEY_FILE` | PEM 内容 | keys.go |
+| **存储 (通用)** | | | | | |
+| 18 | `storage.encryption_key` | `AUTHELIA_STORAGE_ENCRYPTION_KEY` | `AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE` | 加密密钥 | keys.go |
+| **存储 (MySQL)** | | | | | |
+| 19 | `storage.mysql.password` | `AUTHELIA_STORAGE_MYSQL_PASSWORD` | `AUTHELIA_STORAGE_MYSQL_PASSWORD_FILE` | 数据库密码 | keys.go |
+| 20 | `storage.mysql.tls.certificate_chain` | `AUTHELIA_STORAGE_MYSQL_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_STORAGE_MYSQL_TLS_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go |
+| 21 | `storage.mysql.tls.private_key` | `AUTHELIA_STORAGE_MYSQL_TLS_PRIVATE_KEY` | `AUTHELIA_STORAGE_MYSQL_TLS_PRIVATE_KEY_FILE` | PEM 内容 | keys.go |
+| **存储 (PostgreSQL)** | | | | | |
+| 22 | `storage.postgres.password` | `AUTHELIA_STORAGE_POSTGRES_PASSWORD` | `AUTHELIA_STORAGE_POSTGRES_PASSWORD_FILE` | 数据库密码 | keys.go |
+| 23 | `storage.postgres.tls.certificate_chain` | `AUTHELIA_STORAGE_POSTGRES_TLS_CERTIFICATE_CHAIN` | `AUTHELIA_STORAGE_POSTGRES_TLS_CERTIFICATE_CHAIN_FILE` | PEM 内容 | keys.go |
+| 24 | `storage.postgres.tls.private_key` | `AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY` | `AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY_FILE` | PEM 内容 | keys.go |
 
 **废弃但仍可用的敏感字段**（通过 `deprecation.go` 的 `getSecretConfigMap()` 路径生效）：
 
@@ -507,57 +512,191 @@ secretExclusionExact  = []string{
 
 ### 5.6 不支持 *_FILE 迁移的字段及原因
 
-> 以下字段名字看似含敏感后缀，但因各种排除规则**不支持** Secrets 文件加载。
+> 以下字段名字看似含敏感后缀，但因各种原因**不建议或不支持** Secrets 文件加载。
 
-| 配置键 | 敏感后缀 | 排除原因 | 排除规则 |
-|--------|---------|---------|---------|
-| **精确排除** | | | |
-| `server.tls.key` | `.key` | TLS 私钥是文件路径引用，不是密钥本身值 | `secretExclusionExact` |
-| `authentication_backend.disable_reset_password` | `.password` | 布尔值开关，非密码 | `secretExclusionExact` |
-| `tls_key` | `_key` | 废弃键名，映射到 `server.tls.key`，同样是文件路径 | `secretExclusionExact` |
-| **前缀排除** | | | |
-| `identity_providers.oidc.lifespans.access_token` | `_token` | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.authorize_code` | 无 | 同上（仅作说明，此键不含敏感后缀） | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.id_token` | `_token` | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.refresh_token` | `_token` | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.device_code` | 无 | 同上 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.jwt_secured_authorization` | 无 | 同上 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.minimum_parameter_entropy` | `_key` | 最小参数熵值，非密钥 | `secretExclusionPrefix` |
-| `identity_providers.oidc.lifespans.custom.*` 及子键 | `_token` / `_key` | 通配符 + 前缀双重排除 | `secretExclusionPrefix` + `.*.` |
-| **数组项排除** | | | |
-| `identity_providers.oidc.clients[].client_secret` | `_secret` | OIDC 客户端数组项，不支持 Secrets | `[]` 排除 |
-| `identity_providers.oidc.clients[].jwks[].key` | `.key` | 客户端 JWKS 数组项 | `[]` 排除 |
-| `identity_providers.oidc.clients[].jwks[].certificate_chain` | `_chain` | 客户端 JWKS 数组项 | `[]` 排除 |
-| `identity_providers.oidc.jwks[].key` | `.key` | 全局 JWKS 数组项 | `[]` 排除 |
-| `identity_providers.oidc.jwks[].certificate_chain` | `_chain` | 全局 JWKS 数组项 | `[]` 排除 |
-| `storage.postgres.servers[].tls.certificate_chain` | `_chain` | PostgreSQL 多服务器数组项 | `[]` 排除 |
-| `storage.postgres.servers[].tls.private_key` | `_key` | PostgreSQL 多服务器数组项 | `[]` 排除 |
-| **后缀不匹配** | | | |
-| `authentication_backend.file.password.argon2.key_length` | — | 以 `_length` 结尾，非 `_key` | 后缀不匹配 |
-| `authentication_backend.file.password.scrypt.key_length` | — | 以 `_length` 结尾，非 `_key` | 后缀不匹配 |
-| `identity_providers.oidc.discovery_signed_response_key_id` | — | 以 `_key_id` 结尾，非 `_key` | 后缀不匹配 |
-| `identity_providers.oidc.clients[].*_key_id` 系列 | `_id` | 以 `_key_id` 结尾，非 `_key`；且含 `[]` | 后缀不匹配 + `[]` |
-| `authentication_backend.password_reset.disable` | — | 以 `_disable` 结尾，非 `_password` | 后缀不匹配 |
-| `authentication_backend.password_reset.custom_url` | — | 以 `_url` 结尾，非 `_password` | 后缀不匹配 |
-| `authentication_backend.password_change.disable` | — | 以 `_disable` 结尾，非 `_password` | 后缀不匹配 |
+| 配置键 | 敏感后缀 | 字段类型 | `IsSecretKey()` | 不支持原因 | 排除规则 |
+|--------|---------|---------|----------------|-----------|---------|
+| **精确排除 (路径型字段)** | | | | | |
+| `server.tls.key` | `.key` | 路径字符串 | **false** | 指向 TLS 私钥的文件路径，不是密钥内容本身 | `secretExclusionExact` |
+| `tls_key`（废弃） | `_key` | 路径字符串 | **false** | 废弃键名，映射到 `server.tls.key`，同样是路径 | `secretExclusionExact` |
+| **设计缺陷：路径型但被误判** | | | | | |
+| `storage.postgres.ssl.key` | `.key` | 路径字符串 | **true** ⚠️ | 已废弃的旧 SSL 配置，是文件路径，Authelia 自己 `os.ReadFile()` 读取 | 无排除，设计缺陷 |
+| `storage.postgres.ssl.certificate` | 无 | 路径字符串 | **false** | 已废弃的旧 SSL 配置，是文件路径，后缀是 `certificate` 非 `certificate_chain` | 后缀不匹配 |
+| `storage.postgres.ssl.root_certificate` | 无 | 路径字符串 | **false** | 已废弃的旧 SSL 配置，是文件路径 | 后缀不匹配 |
+| `server.tls.certificate` | 无 | 路径字符串 | **false** | 指向 TLS 证书的文件路径，后缀是 `certificate` | 后缀不匹配 |
+| **布尔值误用后缀** | | | | | |
+| `authentication_backend.disable_reset_password` | `.password` | 布尔值 | **false** | 布尔开关 `true/false`，非密码 | `secretExclusionExact` |
+| **前缀排除 (生命周期配置)** | | | | | |
+| `identity_providers.oidc.lifespans.access_token` | `_token` | 时间值 | **false** | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
+| `identity_providers.oidc.lifespans.id_token` | `_token` | 时间值 | **false** | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
+| `identity_providers.oidc.lifespans.refresh_token` | `_token` | 时间值 | **false** | OIDC 生命周期时间配置，非密钥 | `secretExclusionPrefix` |
+| `identity_providers.oidc.lifespans.minimum_parameter_entropy` | `_key` | 数字值 | **false** | 最小参数熵配置，非密钥 | `secretExclusionPrefix` |
+| `identity_providers.oidc.lifespans.custom.*` 子键 | `_token` / `_key` | 时间值 | **false** | 通配符 + 前缀双重排除 | `secretExclusionPrefix` + `.*.` |
+| **数组项排除** | | | | | |
+| `identity_providers.oidc.clients[].client_secret` | `_secret` | 字符串 | **false** | OIDC 客户端数组项，不支持 Secrets | `[]` 排除 |
+| `identity_providers.oidc.clients[].jwks[].key` | `.key` | 内容型 | **false** | 客户端 JWKS 数组项 | `[]` 排除 |
+| `identity_providers.oidc.clients[].jwks[].certificate_chain` | `_chain` | 内容型 | **false** | 客户端 JWKS 数组项 | `[]` 排除 |
+| `identity_providers.oidc.jwks[].key` | `.key` | 内容型 | **false** | 全局 JWKS 数组项 | `[]` 排除 |
+| `identity_providers.oidc.jwks[].certificate_chain` | `_chain` | 内容型 | **false** | 全局 JWKS 数组项 | `[]` 排除 |
+| `storage.postgres.servers[].tls.certificate_chain` | `_chain` | 内容型 | **false** | PostgreSQL 多服务器数组项 | `[]` 排除 |
+| `storage.postgres.servers[].tls.private_key` | `_key` | 内容型 | **false** | PostgreSQL 多服务器数组项 | `[]` 排除 |
+| **后缀不匹配** | | | | | |
+| `*.key_length` 系列 | 无 | 数字值 | **false** | 以 `_length` 结尾，非 `_key` | 后缀不匹配 |
+| `*_key_id` 系列 | 无 | 字符串 | **false** | 以 `_key_id` 结尾，非 `_key` | 后缀不匹配 |
+| `*.password_reset.disable` | 无 | 布尔值 | **false** | 以 `_disable` 结尾，非 `_password` | 后缀不匹配 |
+| `*.password_reset.custom_url` | 无 | URL | **false** | 以 `_url` 结尾，非 `_password` | 后缀不匹配 |
 
-### 5.7 特别说明：`storage.postgres.ssl.key` vs `server.tls.key`
+### 5.7 特别说明：`storage.postgres.ssl.key` 的设计缺陷
 
-这两个键容易混淆，但处理方式完全不同：
+这是最容易混淆的字段，需要特别注意：
 
-| 键 | `IsSecretKey()` 结果 | 支持 `*_FILE` | 原因 |
-|----|---------------------|--------------|------|
-| `server.tls.key` | **false**（精确排除） | 不支持 | 指向 TLS 证书私钥的**文件路径**，非密钥内容本身 |
-| `storage.postgres.ssl.key` | **true** | 支持 | PostgreSQL SSL 客户端私钥的**内容**，通过 `ssl.key` 配置项直接传入 |
+| 对比项 | `server.tls.key` | `storage.postgres.ssl.key` | `storage.postgres.tls.private_key` |
+|--------|-----------------|---------------------------|----------------------------------|
+| Schema 类型 | `string` | `string` | `CryptographicPrivateKey` |
+| jsonschema 描述 | "Path to the Private Key" | "Path to the Private Key to use" | "The private key" |
+| 读取方式 | Authelia 调用 `os.ReadFile` | Authelia 调用 `os.ReadFile` | 直接解析 PEM 内容 |
+| `IsSecretKey()` | **false**（精确排除） | **true**（设计缺陷） | **true**（正确） |
+| 支持 `*_FILE` | ❌ 不支持 | ❌ **不建议使用**（虽然技术上可以） | ✅ 正确支持 |
+| 状态 | 活跃 | 已废弃（deprecated） | 新的标准方式 |
 
 **代码验证**（`const.go:82`）：
 ```go
-secretExclusionExact = []string{"server.tls.key", "authentication_backend.disable_reset_password", "tls_key"}
+secretExclusionExact = []string{
+    "server.tls.key", 
+    "authentication_backend.disable_reset_password", 
+    "tls_key"
+}
 ```
 
-`storage.postgres.ssl.key` 不在精确排除列表中，因此 `IsSecretKey()` 返回 `true`，可以使用 `AUTHELIA_STORAGE_POSTGRES_SSL_KEY_FILE` 进行迁移。
+`storage.postgres.ssl.key` 不在精确排除列表中，但它实际上和 `server.tls.key` 完全一样，都是**文件路径**，不是内容。这是一个设计疏忽。
 
-### 5.8 废弃键的 Secrets 处理路径
+**风险说明**：
+- 如果你用 `AUTHELIA_STORAGE_POSTGRES_SSL_KEY_FILE=/path/to/key.pem`，Authelia 会把 `/path/to/key.pem` 读成字符串内容 `"-----BEGIN PRIVATE KEY-----\n..."`
+- 然后 Authelia 会尝试用这个 PEM 内容字符串作为**文件路径**去调用 `os.ReadFile()`
+- 结果必然是文件不存在错误
+
+**正确迁移方式**：
+```yaml
+# 旧方式（已废弃，配置路径）
+storage:
+  postgres:
+    ssl:
+      key: /etc/authelia/pg-client-key.pem  # 路径字符串
+
+# 新方式（推荐，配置内容，支持 *_FILE）
+storage:
+  postgres:
+    tls:
+      private_key: |
+        -----BEGIN PRIVATE KEY-----
+        MIIEvg...
+        -----END PRIVATE KEY-----
+# 或者用 *_FILE 环境变量
+# AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY_FILE=/run/secrets/pg-client-key.pem
+```
+
+### 5.8 迁移判定矩阵（可直接执行）
+
+> ✅ = 可用，❌ = 不可用，⚠️ = 有风险，🚀 = 推荐方式
+>
+> **判定依据**：Schema 类型 + 实际读取方式 + jsonschema 描述
+
+| 类别 | 配置键 | Schema 类型 | 读取方式 | `IsSecretKey()` | 支持 `*_FILE` | 风险等级 | 正确迁移方式 | 代码引用 |
+|------|--------|------------|---------|----------------|--------------|---------|-------------|---------|
+| **✅ 密码字符串** | | | | | | | | |
+| | `authentication_backend.ldap.password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE` | `schema/authentication.go` |
+| | `notifier.smtp.password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE` | `schema/notifier.go` |
+| | `session.redis.password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_SESSION_REDIS_PASSWORD_FILE` | `schema/session.go` |
+| | `session.redis.high_availability.sentinel_password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_SESSION_REDIS_HIGH_AVAILABILITY_SENTINEL_PASSWORD_FILE` | `schema/session.go` |
+| | `storage.mysql.password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_STORAGE_MYSQL_PASSWORD_FILE` | `schema/storage.go:28` |
+| | `storage.postgres.password` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_STORAGE_POSTGRES_PASSWORD_FILE` | `schema/storage.go:28` |
+| **✅ 密钥/Secret 字符串** | | | | | | | | |
+| | `session.secret` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_SESSION_SECRET_FILE` | `schema/session.go` |
+| | `storage.encryption_key` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE` | `schema/storage.go:15` |
+| | `identity_validation.reset_password.jwt_secret` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE` | `schema/identity_validation.go` |
+| | `identity_providers.oidc.hmac_secret` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE` | `schema/identity_providers.go` |
+| | `duo_api.integration_key` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_DUO_API_INTEGRATION_KEY_FILE` | `schema/duo.go` |
+| | `duo_api.secret_key` | `string` | 直接使用 | true | ✅ | 低 | `AUTHELIA_DUO_API_SECRET_KEY_FILE` | `schema/duo.go` |
+| **✅ TLS 内容型字段（推荐 🚀）** | | | | | | | | |
+| | `*.tls.private_key` | `CryptographicPrivateKey` | 直接解析 PEM | true | ✅ | 低 | `*_PRIVATE_KEY_FILE` | `schema/shared.go:15` |
+| | `*.tls.certificate_chain` | `X509CertificateChain` | 直接解析 PEM | true | ✅ | 低 | `*_CERTIFICATE_CHAIN_FILE` | `schema/shared.go:16` |
+| **⚠️ 路径型字段（设计缺陷）** | | | | | | | | |
+| | `storage.postgres.ssl.key` | `string` | `os.ReadFile()` | true ⚠️ | ❌ **不建议** | 高 | 直接配置路径，或改用 `storage.postgres.tls.private_key` | `schema/storage.go:60` + `storage/sql_provider_backend_postgres.go:333` |
+| | `storage.postgres.ssl.certificate` | `string` | `os.ReadFile()` | false | ❌ | 中 | 直接配置路径，或改用 `storage.postgres.tls.certificate_chain` | `schema/storage.go:59` + `storage/sql_provider_backend_postgres.go:337` |
+| | `storage.postgres.ssl.root_certificate` | `string` | `os.ReadFile()` | false | ❌ | 中 | 直接配置路径字符串 | `schema/storage.go:58` + `storage/sql_provider_backend_postgres.go:317` |
+| **❌ 路径型字段（正确排除）** | | | | | | | | |
+| | `server.tls.key` | `string` | `os.ReadFile()` | false | ❌ | 低 | 直接配置路径字符串 | `schema/server.go:49` |
+| | `server.tls.certificate` | `string` | `os.ReadFile()` | false | ❌ | 低 | 直接配置路径字符串 | `schema/server.go:48` |
+| | `server.tls.client_certificates[]` | `[]string` | `os.ReadFile()` | false | ❌ | 低 | 直接配置路径字符串列表 | `schema/server.go:50` |
+| **❌ 数组项（不支持 Secrets）** | | | | | | | | |
+| | `identity_providers.oidc.clients[].client_secret` | `string` | 直接使用 | false | ❌ | 中 | 在 YAML 中配置，或使用模板过滤器 | 含 `[]` 排除 |
+| | `identity_providers.oidc.jwks[].key` | `CryptographicPrivateKey` | 直接解析 PEM | false | ❌ | 中 | 在 YAML 中配置 | 含 `[]` 排除 |
+| | `storage.postgres.servers[].tls.*` | 内容型 | 直接解析 PEM | false | ❌ | 中 | 在 YAML 中配置 | 含 `[]` 排除 |
+| **❌ 生命周期配置（前缀排除）** | | | | | | | | |
+| | `identity_providers.oidc.lifespans.*_token` | `time.Duration` | 时间值 | false | ❌ | 低 | 正常配置，非敏感 | 前缀 `identity_providers.oidc.lifespans.` |
+
+### 5.8.1 迁移决策流程图
+
+```
+配置键检查
+    │
+    ├─ 含 "[]" → ❌ 数组项，不支持 *_FILE
+    │
+    ├─ 前缀匹配 "identity_providers.oidc.lifespans." → ❌ 时间配置
+    │
+    ├─ 精确匹配排除列表（server.tls.key 等） → ❌ 路径型字段
+    │
+    ├─ IsSecretKey() = false → ❌ 不支持
+    │
+    └─ IsSecretKey() = true
+        │
+        ├─ 检查 Schema 类型和读取方式
+        │   ├─ 内容型（CryptographicPrivateKey 等） → ✅ 支持 *_FILE
+        │   └─ 路径型（string + os.ReadFile） → ⚠️ 不建议，改用新配置
+        │
+        └─ 验证 jsonschema 描述
+            ├─ "Path to..." → ❌ 路径型
+            └─ "The secret/password/key" → ✅ 内容型
+```
+
+### 5.8.2 高风险字段迁移示例
+
+#### 错误示例：`storage.postgres.ssl.key` 使用 `*_FILE`
+
+```bash
+# ❌ 错误：路径型字段使用 *_FILE 会导致"路径的路径"问题
+export AUTHELIA_STORAGE_POSTGRES_SSL_KEY_FILE=/run/secrets/pg-client-key.pem
+# Authelia 会把文件内容（PEM字符串）当作文件路径去 os.ReadFile()
+# 结果：open -----BEGIN PRIVATE KEY-----\n...: no such file or directory
+```
+
+#### 正确示例 1：继续使用路径型配置（挂载 Secret 文件）
+
+```yaml
+# ✅ 正确：直接配置文件路径，Secret 挂载到该路径
+storage:
+  postgres:
+    ssl:
+      key: /run/secrets/pg-client-key.pem  # Docker/K8s 挂载到此处
+```
+
+#### 正确示例 2：迁移到内容型配置（推荐）
+
+```bash
+# ✅ 正确：使用新的 tls.private_key（内容型）支持 *_FILE
+export AUTHELIA_STORAGE_POSTGRES_TLS_PRIVATE_KEY_FILE=/run/secrets/pg-client-key.pem
+```
+
+```yaml
+# YAML 中删除 ssl.key，改用 tls 配置
+storage:
+  postgres:
+    tls:
+      # private_key 内容从 *_FILE 环境变量注入
+      minimum_version: TLS1.2
+```
+
+### 5.9 废弃键的 Secrets 处理路径
 
 废弃键的 `_FILE` 环境变量通过 `getSecretConfigMap()` 的第二条遍历路径生效（`helpers.go:70-78`）：
 
@@ -572,7 +711,7 @@ for key := range ds {  // ds = deprecations 映射
 
 这意味着即使配置键已从 `schema.Keys` 中移除（如 `jwt_secret`），只要仍保留在 `deprecations` 映射中，其 `*_FILE` 环境变量依然有效，但值会被映射到废弃键本身，然后通过 `koanfRemapKeys()` 重映射到新键。
 
-### 5.9 迁移清单验证
+### 5.10 迁移清单验证
 
 可以通过以下代码验证敏感字段识别（来自 `helpers_test.go:91-103` 和 `provider_test.go:28-68`）：
 
@@ -1077,6 +1216,12 @@ session.name = "my_session"   # 来自环境变量
 | 配置验证入口 | `internal/configuration/validator/configuration.go` | 17-77 |
 | 启动配置加载 | `internal/commands/context.go` | 437-456 |
 | 过滤器帮助文档 | `internal/commands/const.go` | 910-932 |
+| **内容型 TLS 配置结构 | `internal/configuration/schema/shared.go` | 8-17 |
+| **路径型 Server TLS 结构 | `internal/configuration/schema/server.go` | 47-51 |
+| **PostgreSQL 遗留 SSL 结构 | `internal/configuration/schema/storage.go` | 55-61 |
+| **PostgreSQL SSL 路径读取 | `internal/storage/sql_provider_backend_postgres.go` | 305-351 |
+| **PostgreSQL SSL key 读取 | `internal/storage/sql_provider_backend_postgres.go` | 328-348 |
+| **MySQL TLS 配置处理 | `internal/storage/sql_provider_backend_mysql.go` | 35-59 |
 
 ---
 
