@@ -470,8 +470,15 @@ func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) ([]byte, 
 | JWT 结构体定义（含 IssuedIP） | `internal/model/identity_verification.go` | 26-38 |
 | FindIdentityVerification（无 IP 条件） | `internal/storage/sql_provider.go` | 982-1001 |
 | SaveIdentityVerification | `internal/storage/sql_provider.go` | 953-961 |
-| ConsumeIdentityVerification | `internal/storage/sql_provider.go` | 964-970 |
-| RevokeIdentityVerification | `internal/storage/sql_provider.go` | 972-979 |
+| ConsumeIdentityVerification（无原子防护） | `internal/storage/sql_provider.go` | 964-970 |
+| RevokeIdentityVerification（无原子防护） | `internal/storage/sql_provider.go` | 972-979 |
+| **JWT Consume SQL 模板** | `internal/storage/sql_provider_queries.go` | 68-71 |
+| **JWT Revoke SQL 模板** | `internal/storage/sql_provider_queries.go` | 73-76 |
+| **JWT Select SQL 模板** | `internal/storage/sql_provider_queries.go` | 59-62 |
+| **OTC Consume SQL 模板** | `internal/storage/sql_provider_queries.go` | 104-107 |
+| **OTC Revoke SQL 模板** | `internal/storage/sql_provider_queries.go` | 109-112 |
+| ConsumeOneTimeCode（原子防护） | `internal/storage/sql_provider.go` | 1035-1055 |
+| RevokeOneTimeCode（原子防护） | `internal/storage/sql_provider.go` | 1058-1077 |
 | JWT 消耗 IP 记录 | `internal/middlewares/identity_verification.go` | 256 |
 | **邮件通知 IP 记录** | `internal/handlers/util.go` | 63 |
 | RequireElevated 中间件 | `internal/middlewares/require_auth.go` | 23-56 |
@@ -1089,7 +1096,7 @@ func (p *SQLProvider) LoadOneTimeCode(ctx context.Context, username string, ip m
 
 ---
 
-#### 调用链F: 身份验证 JWT 的 IP 纯记录（无校验）
+#### 调用链F: 身份验证 JWT 的 IP 纯记录与并发消费窗口
 
 **影响**：密码重置、邮箱验证等流程的 JWT 签发与消耗。
 
@@ -1103,7 +1110,7 @@ model/identity_verification.go:41-52  ← ToIdentityVerificationClaim: JWT claim
   ↓                                         ↑ 注意：IP 不在 JWT claims 中！
 identity_verification.go:82   ← SaveIdentityVerification: 写入数据库（含 IssuedIP）
   ↓
-identity_verification.go:170-224  ← IdentityVerificationFinish:
+identity_verification.go:170-260  ← IdentityVerificationFinish:
   ↓
   1) jwt.ParseWithClaims: 仅验证签名、过期、issuer（无 IP 校验）
   2) FindIdentityVerification(jti): 仅按 JTI 查询（无 IP 条件）
@@ -1149,14 +1156,29 @@ func (p *SQLProvider) FindIdentityVerification(ctx context.Context, jti string) 
 }
 ```
 
-**关键代码3: ConsumeIdentityVerification 只记录 IP** (`storage/sql_provider.go:964-970`):
+**关键代码3: ConsumeIdentityVerification 只记录 IP，无原子防护** (`storage/sql_provider.go:964-970`):
 ```go
 func (p *SQLProvider) ConsumeIdentityVerification(ctx context.Context, jti string, ip model.NullIP) error {
-    // UPDATE SET consumed=NOW(), consumed_ip=? WHERE jti=?
-    // ip 只是写入 consumed_ip 字段，不参与 WHERE 条件
+    // SQL: UPDATE %s SET consumed = ?, consumed_ip = ? WHERE jti = ?
+    //               ↑ 只有 jti 一个 WHERE 条件
+    //               ⚠️ 没有 consumed IS NULL 的防护条件！
     if _, err = p.db.ExecContext(ctx, p.sqlConsumeIdentityVerification, time.Now(), ip, jti); err != nil {
         return fmt.Errorf("error updating identity verification: %w", err)
     }
+    // ⚠️ 不检查 RowsAffected！即使 0 行受影响也不报错
+    return nil
+}
+```
+
+**关键代码4: RevokeIdentityVerification 同样无原子防护** (`storage/sql_provider.go:972-979`):
+```go
+func (p *SQLProvider) RevokeIdentityVerification(ctx context.Context, jti string, ip model.NullIP) error {
+    // SQL: UPDATE %s SET revoked = ?, revoked_ip = ? WHERE jti = ?
+    //               ⚠️ 同样没有 revoked IS NULL 的防护条件
+    if _, err = p.db.ExecContext(ctx, p.sqlRevokeIdentityVerification, time.Now(), ip, jti); err != nil {
+        return fmt.Errorf("error updating identity verification: %w", err)
+    }
+    // ⚠️ 不检查 RowsAffected
     return nil
 }
 ```
@@ -1172,9 +1194,81 @@ func (p *SQLProvider) ConsumeIdentityVerification(ctx context.Context, jti strin
 - 伪造 IP 只影响审计记录：数据库中 `issued_ip`、`consumed_ip`、`revoked_ip` 字段被写入伪造值
 - 攻击者窃取 JWT token 后可在任何 IP 使用，这是**设计意图**（密码重置邮件的链接应可在任何设备打开）
 
+##### 并发一致性分析：Find → Consume/Revoke 的 TOCTOU 窗口
+
+JWT 的消耗流程分为两步执行：
+
+```
+请求A: FindIdentityVerification(jti) → found=true → ConsumeIdentityVerification(jti, ipA)
+请求B: FindIdentityVerification(jti) → found=true → ConsumeIdentityVerification(jti, ipB)
+                    ↑                                      ↑
+              两个请求都通过了 Find                     两个都执行了 Consume
+```
+
+**TOCTOU（Time-of-Check-Time-of-Use）窗口存在**：
+
+| 步骤 | JWT 流程 | OTC 流程 |
+|------|---------|---------|
+| 1. 查询 | `FindIdentityVerification(jti)` — SELECT 无锁 | `LoadOneTimeCode(username, ip, intent, raw)` — SELECT 无锁 |
+| 2. 应用层校验 | 检查 consumed/revoked/expired — **应用层逻辑** | 检查 expired/revoked/consumed — **应用层逻辑** |
+| 3. 写入 | `ConsumeIdentityVerification(jti, ip)` — UPDATE WHERE jti=? | `ConsumeOneTimeCode(signature, consumedIP)` — UPDATE WHERE signature=? AND consumed IS NULL AND revoked IS NULL |
+| 4. 结果检查 | **不检查 RowsAffected** | **检查 RowsAffected**：0→报错，>1→报错 |
+
+**并发窗口对比**：
+
+```
+JWT 并发场景（无原子防护）:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  请求A:  Find→found   ──────── Consume(jti,ipA) → 成功
+  请求B:       Find→found ──────── Consume(jti,ipB) → 成功（覆盖A的consumed_ip）
+                           ↑
+                     两次 Consume 都成功！
+                     consumed_ip 被后到的请求覆盖
+                     ⚠️ 无 RowsAffected 检查，静默覆盖
+
+OTC 并发场景（原子防护）:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  请求A:  Load→found  ──────── Consume(sig,ipA) → UPDATE WHERE sig=? AND consumed IS NULL → rows=1 ✓
+  请求B:       Load→found ──────── Consume(sig,ipB) → UPDATE WHERE sig=? AND consumed IS NULL → rows=0 ✗
+                           ↑
+                     请求B 的 UPDATE 命中 0 行
+                     因为请求A 已将 consumed 设为非 NULL
+                     ConsumeOneTimeCode 返回 "no rows affected" 错误
+                     ✅ 原子性由 SQL WHERE 条件保证
+```
+
+**核心差异：SQL UPDATE 的 WHERE 条件**
+
+| 维度 | JWT Consume | OTC Consume |
+|------|------------|-------------|
+| **SQL** | `UPDATE SET consumed=?, consumed_ip=? WHERE jti=?` | `UPDATE SET consumed=?, consumed_ip=? WHERE signature=? AND consumed IS NULL AND revoked IS NULL` |
+| **WHERE 条件** | 只有 `jti` | `signature` + `consumed IS NULL` + `revoked IS NULL` |
+| **原子防护** | ❌ 无。已消耗的行仍满足 `WHERE jti=?` | ✅ 有。已消耗的行不满足 `consumed IS NULL` |
+| **RowsAffected 检查** | ❌ 不检查 | ✅ 检查：0→错误，1→成功，>1→错误 |
+| **并发消耗** | 两个请求都成功，后者覆盖 `consumed_ip` | 第二个请求报错 `no rows affected` |
+| **Revoke 同理** | `WHERE jti=?` — 无原子防护 | `WHERE public_id=? AND consumed IS NULL AND revoked IS NULL` — 有原子防护 |
+
+**JWT 并发窗口的实际影响**：
+
+1. **密码重置链接双击**：用户快速双击邮件中的密码重置链接，两个请求同时到达
+   - 两个请求都通过 `FindIdentityVerification` → 都返回 `found=true`
+   - 两个请求都执行 `ConsumeIdentityVerification`
+   - 第一个请求完成密码重置，第二个请求发现用户密码已变更（业务层校验）→ 报错
+   - 但数据库中 `consumed_ip` 被第二个请求覆盖（如果两次请求 IP 不同）
+
+2. **攻击者抢在用户前消耗**：如果攻击者窃取了 JWT token 并在用户之前消耗
+   - 攻击者的请求通过 `Find` → `Consume` → 成功
+   - 用户的请求也通过 `Find` → 但在 `Consume` 之前被攻击者的请求先标记了 `consumed`
+   - 用户的 `Consume` 仍然执行成功（因为 WHERE 条件只有 `jti`），但业务逻辑层面会因为密码已被重置而失败
+   - **这不是由 TOCTOU 引入的新漏洞**——JWT token 本身就是一次性凭证，窃取即等效于拥有
+
+3. **consumed_ip 被覆盖的审计影响**：如果两个不同 IP 的请求同时消耗同一个 JWT
+   - `consumed_ip` 最终值为最后一个到达的请求的 IP
+   - 可能导致审计记录中 `consumed_ip` 与实际消耗者 IP 不符
+
 ---
 
-#### OTC vs JWT IP 机制对比
+#### OTC vs JWT IP 机制与并发对比
 
 | 维度 | OTC（调用链E） | JWT（调用链F） |
 |------|---------------|---------------|
@@ -1184,6 +1278,10 @@ func (p *SQLProvider) ConsumeIdentityVerification(ctx context.Context, jti strin
 | **IP 是记录还是校验** | **强校验** — 密码学级别 HMAC 绑定 | **纯记录** — 仅写入数据库供审计 |
 | **伪造 IP 可绕过** | ❌ 不可能（除非知道签发时 IP 并伪造相同值） | ✅ 无需绕过（IP 不参与校验） |
 | **设计意图** | 防止 OTC 被窃取后跨 IP 使用 | 允许用户在任何设备通过邮件链接重置密码 |
+| **Consume SQL WHERE** | `signature=? AND consumed IS NULL AND revoked IS NULL` | `jti=?`（无 consumed/revoked 条件） |
+| **并发消耗防护** | ✅ 原子：第二次 Consume 命中 0 行 → 报错 | ❌ 非原子：第二次 Consume 覆盖 consumed_ip |
+| **RowsAffected 检查** | ✅ 检查：0→错误，1→成功，>1→错误 | ❌ 不检查 |
+| **TOCTOU 窗口** | 存在但被 SQL WHERE 原子性消解 | 存在且未被消解（但业务层可兜底） |
 
 ---
 
@@ -1368,7 +1466,100 @@ mailOpts := session.SendLoginEventNotificationOptions{
           但这会降低安全性，应优先修复代理配置
 ```
 
-#### 故障排除决策树
+**步骤5: 区分"令牌并发复用"与"代理头信任链异常"**
+
+两类根因的症状高度相似（用户反馈"操作失败"），但本质和修复方向完全不同：
+
+```
+用户反馈: "令牌无效/操作被拒/验证码无效"
+     │
+     ├─────────────────────────────────────────────────┐
+     │                                                 │
+     ▼                                                 ▼
+  OTC 场景                                         JWT 场景
+  (IP 参与签名)                                    (IP 不参与签名)
+     │                                                 │
+     ├─→ 故障现象是否涉及 IP 变化？                      ├─→ 是否多个请求同时到达？
+     │    ├─ 日志中签发时和验证时的                      │    ├─ 用户是否双击了邮件链接？
+     │    │  remote_ip 是否不同？                       │    ├─ 是否有自动化脚本并行请求？
+     │    │                                            │    └─ consumed_ip 是否与实际消耗者不符？
+     │    ├─ 不同 ──┐                                  │
+     │    └─ 相同 ──┤                                  │
+     │              │                                  │
+     │              ▼                                  ▼
+     │    ┌─────────────────────┐          ┌─────────────────────┐
+     │    │ 代理头信任链异常     │          │ 令牌并发复用         │
+     │    │                     │          │                     │
+     │    │ 根因：              │          │ 根因：              │
+     │    │ X-Forwarded-For 被  │          │ Find + Consume 分步 │
+     │    │ 伪造/遗漏CDN/未清除 │          │ 执行的 TOCTOU 窗口  │
+     │    │                     │          │                     │
+     │    │ 影响范围：           │          │ 影响范围：           │
+     │    │ 全部 IP 依赖功能    │          │ 仅 JWT 流程         │
+     │    │ (ACL/Regulation/    │          │ OTC 有原子防护       │
+     │    │  速率限制/OTC/日志) │          │                     │
+     │    └─────────────────────┘          └─────────────────────┘
+     │              │                                  │
+     │              ▼                                  ▼
+     │    修复方向：                       修复方向：
+     │    修正代理配置                     无需修复（设计如此）
+     │    - 清除客户端 XFF                 - 业务层已兜底
+     │    - 补齐 CDN trustedIPs            - consumed_ip 覆盖仅
+     │    - 网络隔离 Authelia 端口           影响审计，不影响安全
+     │
+     └─→ 通用快速判断法
+          ┌────────────────────────────────────────────────────────┐
+          │  检查项             │ 代理头信任链异常 │ 令牌并发复用    │
+          ├────────────────────┼─────────────────┼────────────────│
+          │ 日志 remote_ip     │ 异常值（CDN/内网）│ 正常值         │
+          │ 同一用户短时间内    │ IP 持续变化      │ IP 不变        │
+          │  的 IP 是否变化     │ (CDN节点切换)    │ (同一客户端)   │
+          ├────────────────────┼─────────────────┼────────────────│
+          │ OTC 签发/验证的     │ 不同的 remote_ip │ 相同 remote_ip │
+          │ remote_ip          │                 │                │
+          ├────────────────────┼─────────────────┼────────────────│
+          │ JWT consumed_ip    │ 为伪造/CDN IP   │ 为第二个请求IP  │
+          │ 是否与实际消耗者    │ 与实际不符       │ 与实际消耗者    │
+          │ 匹配               │                 │ 可能不符        │
+          ├────────────────────┼─────────────────┼────────────────│
+          │ 受影响功能范围      │ 全部 IP 依赖功能 │ 仅 JWT 流程    │
+          │                    │ (OTC/ACL/日志等) │                │
+          ├────────────────────┼─────────────────┼────────────────│
+          │ OTC Consume 错误   │ 可能出现         │ 不可能出现      │
+          │ "no rows affected" │ (IP 不匹配)      │ (IP 匹配)      │
+          └────────────────────────────────────────────────────────┘
+```
+
+**数据库排查 SQL**：
+
+```sql
+-- 检查 JWT 并发消耗：consumed_ip 与 issued_ip 不同的记录
+SELECT jti, username, action, issued_ip, consumed_ip, consumed, revoked_ip, revoked
+FROM identity_verification
+WHERE consumed_ip != issued_ip
+  AND consumed IS NOT NULL
+ORDER BY consumed DESC
+LIMIT 20;
+-- 如果有结果且 consumed_ip 与 issued_ip 差异大（不同网段）
+-- → 可能是并发复用（双击链接）或代理头异常
+-- → 结合日志 remote_ip 判断
+
+-- 检查 OTC 签名不匹配：同一用户短时间内多次签发
+SELECT username, issued_ip, issued_at, expires_at, consumed_at, consumed_ip
+FROM one_time_code
+WHERE intent = 'UserSessionElevation'
+  AND issued_at > NOW() - INTERVAL '1 hour'
+ORDER BY issued_at DESC;
+-- 如果同一用户短时间内签发多个 OTC 且 consumed_at 全为 NULL
+-- → 说明用户反复尝试，验证时 IP 与签发时不同
+-- → 检查签发和验证时间窗口内的 remote_ip 变化
+
+-- 检查 OTC 原子防护是否被触发：寻找 ConsumeOneTimeCode 报错
+-- 在 Authelia 日志中搜索：
+-- grep "no rows affected" authelia.log
+-- 如果出现 → 说明并发请求触发了 OTC 原子防护
+-- 这不是代理头问题，而是正常的并发保护
+```
 
 ```
 收到"IP 配置可能有问题"报告
@@ -1412,3 +1603,6 @@ mailOpts := session.SendLoginEventNotificationOptions{
 8. **Caddy trusted_proxies 位置易错**：`trusted_proxies` 是站点/全局级别指令，**不能**配置在 `forward_auth` 块内部
 9. **多层代理必须完整配置 trustedIPs**：遗漏 CDN 节点 IP 不会导致身份伪造，但会导致所有依赖真实客户端 IP 的功能全面降级（ACL 误拒、封禁失效、审计丢失）
 10. **会话提升 IP 绑定是双刃剑**：IP 绑定防止了会话劫持，但也导致移动办公场景下用户频繁被要求重新验证，需根据实际场景权衡是否通过 `elevated_session.inactivity` 调整策略
+11. **JWT Find+Consume 存在 TOCTOU 窗口但实际风险有限**：`FindIdentityVerification` 和 `ConsumeIdentityVerification` 分步执行，Consume 的 SQL WHERE 只有 `jti=?` 没有 `consumed IS NULL`，并发时两次 Consume 都会成功、后者覆盖 `consumed_ip`。但业务层（密码重置等）的幂等性检查提供了兜底
+12. **OTC Consume 有 SQL 级原子防护**：`ConsumeOneTimeCode` 的 SQL WHERE 包含 `consumed IS NULL AND revoked IS NULL`，且检查 `RowsAffected`（0→错误，1→成功，>1→错误），并发时第二个请求必定失败
+13. **排障时先区分根因类别**：OTC 失效 + `remote_ip` 变化 → 代理头信任链异常；JWT consumed_ip 覆盖 + `remote_ip` 不变 → 令牌并发复用（TOCTOU），无需修代理配置
