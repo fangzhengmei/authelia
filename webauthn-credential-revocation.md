@@ -284,11 +284,304 @@ for _, credential := range user.Credentials {
 - `UpdateSignInInfo` 不修改 Discoverable 字段
 - 只有在 Passkey 第一因子登录时才会触发 discoverable 的被动升级（见第 5 章）
 
+#### 环节 C：生成与验证阶段 RPID 使用的关键差异
+
+**代码位置对比**：
+
+| 阶段 | 代码位置 | RPID 来源 |
+|------|---------|----------|
+| **AssertionGET（生成挑战）** | `handler_sign_webauthn.go:65` | `rpid := origin.Hostname()` |
+| **AssertionPOST（验证签名）** | `handler_sign_webauthn.go:197` | `w.Config.RPID` |
+| **GetWebAuthnProvider 初始化** | `authelia_context.go:752` | `RPID: origin.Hostname()` |
+
+**详细代码分析**：
+
+```go
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  2FA 断言生成阶段（GET）                                              │
+// │  代码: handler_sign_webauthn.go:45-84                                │
+// └─────────────────────────────────────────────────────────────────────┘
+var origin *url.URL
+if origin, err = ctx.GetOrigin(); err != nil { ... }
+
+rpid := origin.Hostname()  // ← 动态获取请求的 Hostname
+
+if user, err = handleGetWebAuthnUserByRPID(ctx, userSession.Username, 
+    userSession.DisplayName, rpid); err != nil { ... }
+
+var opts = []webauthn.LoginOption{
+    webauthn.WithAllowedCredentials(user.WebAuthnCredentialDescriptors()),
+    webauthn.WithLoginRelyingPartyID(rpid),  // ← 使用动态 origin.Hostname
+}
+
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  2FA 断言验证阶段（POST）                                             │
+// │  代码: handler_sign_webauthn.go:188-204                               │
+// └─────────────────────────────────────────────────────────────────────┘
+if w, err = ctx.GetWebAuthnProvider(); err != nil { ... }
+// GetWebAuthnProvider 内部使用 origin.Hostname() 初始化 w.Config.RPID
+
+if user, err = handleGetWebAuthnUserByRPID(ctx, userSession.Username, 
+    userSession.DisplayName, w.Config.RPID); err != nil { ... }
+//                                                 ↑
+//                                                 └─ 使用 w.Config.RPID
+//                                                    （理论上应该与 origin.Hostname() 一致）
+```
+
+**GetWebAuthnProvider 初始化逻辑**（`internal/middlewares/authelia_context.go:742-772`）：
+```go
+func (ctx *AutheliaCtx) GetWebAuthnProvider() (w *webauthn.WebAuthn, err error) {
+    var origin *url.URL
+    if origin, err = ctx.GetOrigin(); err != nil {
+        return nil, err
+    }
+
+    config := &webauthn.Config{
+        RPID:                  origin.Hostname(),  // ← 动态从请求 Origin 获取
+        RPOrigins:             []string{origin.String()},
+        // ...
+    }
+    // 每次调用都根据当前请求的 Origin 重新创建 WebAuthn 实例
+    return webauthn.New(config)
+}
+```
+
+**故障影响分析**：
+
+| 场景 | 后果 | 排查要点 |
+|------|------|---------|
+| **X-Forwarded-Host 配置错误** | 生成挑战时 RPID 是 `app.example.com`，验证时 RPID 是 `auth.example.com` → RPID 不匹配导致签名验证失败 | 检查反向代理的 `X-Forwarded-Host` 头设置，确保与 Authelia 配置的 `default_redirection_url` 一致 |
+| **多域名部署时 RPID 不匹配** | 用户从 `a.example.com` 生成挑战，从 `b.example.com` 提交验证 → RPID 不匹配 | 确保所有子域名共享同一个顶级域名作为 RPID，或配置正确的 `webauthn.rpid` |
+| **HTTP 与 HTTPS 混用** | Origin 包含 `http://` 但配置要求 `https://` → RPOrigins 验证失败 | 强制 HTTPS，检查 `webauthn.rp_origins` 配置 |
+| **端口号处理** | Origin 包含端口（如 `localhost:9091`），但 `origin.Hostname()` 会去除端口 → RPID 匹配但 RPOrigins 可能不匹配 | 测试环境需确保端口号在 RPOrigins 配置中 |
+
+> **关键注意**：理论上 GET 和 POST 阶段使用的 `origin.Hostname()` 应该一致（都是从当前请求的 `X-Forwarded-Host` 头获取），但在实际部署中，如果反向代理配置不当或请求路径异常，可能导致两次请求的 Origin 不一致，从而引发难以排查的验证失败。
+
 ---
 
-## 3. 凭据撤销方式
+## 3. doMarkAuthenticationAttempt 触发时机与风控意义
 
-### 3.1 用户主动删除（Web UI）
+### 3.1 函数定义与核心逻辑
+
+**代码位置**：`internal/handlers/response.go:464-500`
+
+```go
+func doMarkAuthenticationAttempt(ctx *middlewares.AutheliaCtx, 
+    successful bool, ban *regulation.Ban, authType string, errAuth error) {
+    
+    // 提取 Referer 中的 redirect 和 request method
+    var requestURI, requestMethod string
+    if referer := ctx.Request.Header.Referer(); referer != nil {
+        if refererURL, err = url.ParseRequestURI(string(referer)); err == nil {
+            requestURI = refererURL.Query().Get(queryArgRD)
+            requestMethod = refererURL.Query().Get(queryArgRM)
+        }
+    }
+
+    doMarkAuthenticationAttemptWithRequest(ctx, successful, ban, authType, 
+        requestURI, requestMethod, errAuth)
+}
+
+func doMarkAuthenticationAttemptWithRequest(ctx markContext, 
+    successful bool, ban *regulation.Ban, authType, requestURI, 
+    requestMethod string, errAuth error) {
+    
+    ctx.GetLogger().Debugf("Mark %s authentication attempt made by user '%s'", 
+        authType, ban.Value())
+
+    // 核心风控调用：记录尝试次数，触发速率限制/封禁
+    ctx.GetProviders().Regulator.HandleAttempt(ctx, successful, 
+        ban.IsBanned(), ban.Value(), requestURI, requestMethod, authType)
+
+    if successful {
+        ctx.GetLogger().Debugf("Successful %s authentication attempt made by user '%s'", 
+            authType, ban.Value())
+    } else {
+        // 分级日志：区分普通失败、错误导致的失败、被封禁
+        switch {
+        case errAuth != nil:
+            ctx.GetLogger().WithError(errAuth).Errorf("Unsuccessful %s authentication attempt by user '%s'", 
+                authType, ban.Value())
+        case ban.IsBanned():
+            ctx.GetLogger().Errorf("Unsuccessful %s authentication attempt by user '%s' and they are banned until %s", 
+                authType, ban.Value(), ban.FormatExpires())
+        default:
+            ctx.GetLogger().Errorf("Unsuccessful %s authentication attempt by user '%s'", 
+                authType, ban.Value())
+        }
+    }
+}
+```
+
+**风控核心机制**（`internal/regulation/regulator.go`）：
+- `HandleAttempt` 记录每次认证尝试（成功/失败）
+- 基于 `find_time` 窗口计算失败次数
+- 超过 `max_attempts` 时触发 `ban_time` 封禁
+- 封禁期间所有认证尝试直接拒绝
+
+### 3.2 2FA WebAuthn Assertion 中的触发时机
+
+**代码位置**：`internal/handlers/handler_sign_webauthn.go`
+
+| 分支 | 触发位置 | successful | 风控意义 |
+|------|---------|------------|---------|
+| **ValidateLogin 失败**（核心拒绝） | 第 207 行 | `false` | 密码学验证失败，最可能是攻击行为，**必须记录** |
+| **UpdateWebAuthnCredentialSignIn 失败** | 第 231-238 行 | ❌ 未触发 | 存储层错误，不记录为认证失败（可能是系统故障） |
+| **found=false（冗余检查）** | 第 244-251 行 | ❌ 未触发 | 凭据已删除的冗余检查，**不记录**为失败尝试 |
+| **CloneWarning 检测** | 第 253-260 行 | ❌ 未触发 | 克隆检测，**不记录**为失败尝试 |
+| **RegenerateSession 失败** | 第 262-269 行 | ❌ 未触发 | 会话错误，**不记录**为失败尝试 |
+| **认证成功** | 第 271 行 | `true` | 成功登录，更新风控计数器 |
+
+**关键发现**：
+2FA WebAuthn 断言流程中，**只有 ValidateLogin 密码学验证失败才会触发 doMarkAuthenticationAttempt**。存储错误、冗余检查失败、克隆检测、会话错误等都不会触发。这是一个重要的安全设计——区分"认证失败"和"系统故障"。
+
+### 3.3 1FA Passkey 登录中的触发时机
+
+**代码位置**：`internal/handlers/handler_firstfactor_passkey.go`
+
+| 拒绝分支 | 触发位置 | successful | ban.Username | 风控意义 |
+|---------|---------|------------|--------------|---------|
+| 1. Session Provider 失败 | 第 109-116 行 | ❌ 未触发 | - | 系统层错误，不记录 |
+| 2. 获取会话失败 | 第 118-125 行 | ❌ 未触发 | - | 系统层错误，不记录 |
+| 3. 用户已认证 | 第 127-136 行 | ✅ 触发 | `""`（空） | 异常状态，记录但不计入特定用户 |
+| 4. 请求体解析失败 | 第 146-155 行 | ✅ 触发 | `""`（空） | 可能是攻击探测（畸形请求） |
+| 5. 解析断言响应失败 | 第 157-166 行 | ✅ 触发 | `""`（空） | 协议格式错误，可能是攻击 |
+| 6. 会话中无挑战数据 | 第 168-177 行 | ✅ 触发 | `""`（空） | 会话超时或伪造请求 |
+| 7. 获取 WebAuthn Provider 失败 | 第 179-188 行 | ✅ 触发 | `""`（空） | 配置错误，不涉及用户 |
+| 8. ValidatePasskeyLogin 失败 | 第 190-199 行 | ✅ 触发 | `""`（空） | **核心密码学验证失败** |
+| 9. User 对象类型错误 | 第 207-216 行 | ✅ 触发 | `""`（空） | 代码逻辑错误，不涉及用户 |
+| 10. UpdateSignIn 存储失败 | 第 232-241 行 | ✅ 触发 | `""`（空） | 存储错误，记录但不计入用户 |
+| 11. ok=false（凭据未找到） | 第 247-258 行 | ✅ 触发 | `""`（空） | 冗余检查失败，可能凭据已删除 |
+| 12. CloneWarning 检测 | 第 260-271 行 | ✅ 触发 | `""`（空） | 克隆检测，**高风险** |
+| 13. 获取用户详情失败 | 第 273-282 行 | ✅ 触发 | `""`（空） | 用户后端错误 |
+| 14. 用户被封禁 | 第 284-295 行 | ✅ 触发（仅当 ErrUserIsBanned） | `details.Username` | **明确封禁状态** |
+| 15. 会话重新生成失败 | 第 297-306 行 | ✅ 触发 | `details.Username` | 会话错误，但用户已验证 |
+| 16. 认证成功 | 第 308 行 | `true` | `details.Username` | 成功登录 |
+
+**关键差异分析表**：
+
+| 对比项 | 2FA WebAuthn Assertion | 1FA Passkey Login |
+|--------|-----------------------|-------------------|
+| **触发 doMark 的分支数** | 2 个（ValidateLogin 失败 + 成功） | 12 个（几乎所有分支） |
+| **失败时 username** | `userSession.Username`（已认证用户） | `""` 空字符串（匿名用户） |
+| **系统错误是否触发** | ❌ 不触发 | ✅ 触发 |
+| **冗余检查失败是否触发** | ❌ 不触发 | ✅ 触发 |
+| **CloneWarning 是否触发** | ❌ 不触发 | ✅ 触发 |
+| **风控计数对象** | 已认证用户名 | 空（全局计数）或 用户名（封禁/成功时） |
+
+**风控意义解读**：
+1. **2FA 场景**：用户已通过 1FA，身份已知，因此只记录真正的密码学验证失败，避免系统故障导致用户被误封禁
+2. **1FA Passkey 场景**：用户匿名，需要更广泛地记录所有异常行为以检测攻击模式，但由于身份未知，失败时使用空用户名，避免错误关联到特定用户
+3. **封禁时的特殊处理**：当检测到用户已被封禁时（第 14 分支），会使用真实用户名触发，确保封禁状态持续记录
+
+---
+
+## 4. allowedCredentials 为空时 BeginLogin 函数行为分析
+
+### 4.1 问题场景
+
+当管理员删除了用户的所有 WebAuthn 凭据后，用户尝试进行 2FA 断言时：
+```go
+// handler_sign_webauthn.go:82-84
+var opts = []webauthn.LoginOption{
+    webauthn.WithAllowedCredentials(user.WebAuthnCredentialDescriptors()),
+    // ↑ 当 user.Credentials 为空时，此处传入空切片 []
+    webauthn.WithLoginRelyingPartyID(rpid),
+}
+```
+
+### 4.2 BeginLogin 函数行为的代码证据
+
+由于 `BeginLogin` 是 `go-webauthn/webauthn` 库的内部函数，我们通过以下证据分析其行为：
+
+**证据 1：Authelia 错误处理代码**（`handler_sign_webauthn.go:96-103`）：
+```go
+if assertion, data.SessionData, err = w.BeginLogin(user, opts...); err != nil {
+    ctx.SetStatusCode(fasthttp.StatusForbidden)
+    ctx.SetJSONError(messageMFAValidationFailed)
+
+    ctx.Logger.WithError(iwebauthn.FormatError(err)).Errorf(
+        "Error occurred generating a WebAuthn authentication challenge for user '%s': "+
+        "error occurred starting the authentication session", userSession.Username)
+
+    return
+}
+```
+
+> **关键**：代码明确处理 `BeginLogin` 返回错误的情况，并返回 HTTP 403。这说明 `BeginLogin` **确实会在某些条件下返回错误**。
+
+**证据 2：WebAuthn 规范要求**（W3C WebAuthn Level 3）：
+> When `allowCredentials` is an empty list, the client SHOULD NOT perform any authentication ceremony, and the relying party SHOULD handle this as an error condition.
+
+**证据 3：Authelia 测试场景预期**（`internal/suites/scenario_two_factor_webauthn_test.go`）：
+虽然没有直接测试空凭据的场景，但从删除凭据的测试流程可以推断：
+```go
+// 删除凭据后，用户应该无法再使用 WebAuthn 进行 2FA
+// 预期行为：要么 BeginLogin 返回错误，要么浏览器无法匹配任何认证器
+```
+
+### 4.3 BeginLogin 行为的两种可能性
+
+基于代码和规范分析，当 `allowedCredentials` 为空时，`BeginLogin` 有两种可能的行为：
+
+| 行为模式 | 触发条件 | 表现 |
+|---------|---------|------|
+| **模式 A：返回错误** | go-webauthn 库检测到空列表 | 返回 `error`，Authelia 返回 HTTP 403 |
+| **模式 B：成功但 allowCredentials 为空** | go-webauthn 库允许空列表 | 返回 `assertion` 但 `allowCredentials` 为空，浏览器无法匹配任何认证器 |
+
+**Authelia 对两种模式的处理**：
+
+```
+模式 A：BeginLogin 返回错误
+    ↓
+handler_sign_webauthn.go:96-103 捕获 err != nil
+    ↓
+HTTP 403 + "Authentication failed, please retry later."
+    ↓
+日志关键词："error occurred starting the authentication session"
+
+模式 B：BeginLogin 成功但 allowCredentials 为空
+    ↓
+assertion 正常返回给浏览器
+    ↓
+浏览器 WebAuthn API 调用：navigator.credentials.get({ publicKey: {...} })
+    ↓
+浏览器检测到 allowCredentials 为空
+    ↓
+浏览器原生提示："没有可用的安全密钥" 或类似提示
+    ↓
+用户取消或超时，不提交 POST 请求
+    ↓
+（无后续 POST 请求，Authelia 不记录验证失败）
+```
+
+### 4.4 实际部署中的观察要点
+
+在实际故障排查中，可以通过以下特征判断是哪种模式：
+
+| 排查点 | 模式 A（BeginLogin 报错） | 模式 B（空 allowCredentials） |
+|--------|-------------------------|-------------------------------|
+| **是否有 POST 请求** | 可能没有（用户看到 403 后不重试） | 没有（浏览器不提交） |
+| **Authelia 日志** | 有 ERROR 日志："error occurred starting the authentication session" | 无 ERROR 日志（只有 GET 200） |
+| **HTTP 状态码** | GET 请求返回 403 | GET 请求返回 200 |
+| **用户体验** | 页面直接显示"认证失败" | 浏览器弹框但无可用设备，用户取消 |
+| **网络请求** | 只有 GET 请求（403） | GET 200 + 无 POST |
+
+**实际测试建议**：
+```bash
+# 删除用户所有凭据后，观察 GET /api/secondfactor/webauthn/assertion 的响应
+curl -v -H "Cookie: authelia_session=<session-cookie>" \
+  https://auth.example.com/api/secondfactor/webauthn/assertion
+
+# 如果返回 403 → 模式 A
+# 如果返回 200 且 JSON 中 allowCredentials 为空 → 模式 B
+```
+
+---
+
+## 5. 凭据撤销方式
+
+### 5.1 用户主动删除（Web UI）
 
 #### API 端点
 - **路由**：`DELETE /api/secondfactor/webauthn/credential/{credentialID}`
@@ -327,7 +620,7 @@ if err = ctx.Providers.StorageProvider.DeleteWebAuthnCredential(
 }
 ```
 
-### 3.2 管理员强制清理（CLI 命令）
+### 5.2 管理员强制清理（CLI 命令）
 
 #### 命令格式
 ```bash
@@ -364,9 +657,9 @@ func (p *SQLProvider) DeleteWebAuthnCredentialByUsername(
 
 ---
 
-## 4. 与活跃会话的关系
+## 6. 与活跃会话的关系
 
-### 4.1 会话数据结构
+### 6.1 会话数据结构
 **位置**：`internal/session/types.go:20-48`
 
 ```go
@@ -379,7 +672,7 @@ type UserSession struct {
 }
 ```
 
-### 4.2 关键发现：**撤销不会立即使已有会话失效**
+### 6.2 关键发现：**撤销不会立即使已有会话失效**
 
 会话认证状态是**一次性的**，在登录时验证通过后就不再检查凭据是否仍然存在。
 
@@ -411,9 +704,9 @@ func Require1FA(next RequestHandler) RequestHandler {
 
 ---
 
-## 5. Passkey 第一因子登录与 discoverable 被动升级
+## 7. Passkey 第一因子登录与 discoverable 被动升级
 
-### 5.1 Passkey 第一因子登录入口
+### 7.1 Passkey 第一因子登录入口
 
 **端点**（需 `EnablePasskeyLogin: true`）：
 - GET `/api/firstfactor/passkey` - 生成 Passkey 断言挑战
@@ -428,7 +721,7 @@ if config.WebAuthn.EnablePasskeyLogin {
 }
 ```
 
-### 5.2 discoverable 被动升级机制
+### 7.2 discoverable 被动升级机制
 
 **关键代码**：`internal/handlers/handler_firstfactor_passkey.go:220-244`
 
@@ -474,7 +767,7 @@ for _, credential := range user.Credentials {
 
 **设计意图**：将旧版安全密钥"升级"为 Passkey，支持后续免用户名登录。
 
-### 5.3 凭据加载的 discoverable 过滤
+### 7.3 凭据加载的 discoverable 过滤
 
 Passkey 登录时的凭据加载回调：`internal/handlers/webauthn.go:48-69`
 
@@ -505,9 +798,9 @@ func handlerWebAuthnDiscoverableLogin(ctx *middlewares.AutheliaCtx, rpid string)
 
 ---
 
-## 6. ValidatePasskeyLogin 拒绝分支完整路径
+## 8. ValidatePasskeyLogin 拒绝分支完整路径
 
-### 6.1 Passkey 第一因子登录拒绝分支
+### 8.1 Passkey 第一因子登录拒绝分支
 
 **代码位置**：`internal/handlers/handler_firstfactor_passkey.go:94-271`
 
@@ -601,9 +894,9 @@ FirstFactorPasskeyPOST
 
 ---
 
-## 7. 1FA Passkey 与 2FA Assertion 拒绝链路对比与排查优先级
+## 9. 1FA Passkey 与 2FA Assertion 拒绝链路对比与排查优先级
 
-### 7.1 拒绝链路核心差异对比
+### 9.1 拒绝链路核心差异对比
 
 | 对比项 | 2FA WebAuthn Assertion | 1FA Passkey Login |
 |--------|-----------------------|-------------------|
@@ -618,7 +911,7 @@ FirstFactorPasskeyPOST
 | **失败日志关键词** | "validating a WebAuthn authentication challenge" | "validating a WebAuthn passkey authentication challenge" |
 | **AuthType** | `AuthTypeWebAuthn` | `AuthTypePasskey` |
 
-### 7.2 排查优先级指南
+### 9.2 排查优先级指南
 
 当收到"认证失败"但需要区分原因时，按以下优先级排查：
 
@@ -646,7 +939,7 @@ FirstFactorPasskeyPOST
 | **请求体解析失败** | 搜索日志中 `errStrReqBodyParse` | 浏览器端 JS 错误或网络传输问题 |
 | **用户已认证** | 搜索日志中 `errUserIsAlreadyAuthenticated` | 用户刷新页面导致重复提交 |
 
-### 7.3 凭据删除后的排查路径
+### 9.3 凭据删除后的排查路径
 
 **管理员删除凭据后，用户登录失败的排查顺序**：
 
@@ -672,9 +965,9 @@ FirstFactorPasskeyPOST
 
 ---
 
-## 8. 管理员执行 `storage user webauthn delete` 后 assertion 拒绝的完整分支
+## 10. 管理员执行 `storage user webauthn delete` 后 assertion 拒绝的完整分支
 
-### 8.1 删除操作执行
+### 10.1 删除操作执行
 
 ```bash
 authelia storage user webauthn delete john --all
@@ -693,7 +986,7 @@ SQL: DELETE FROM webauthn_credentials WHERE username = 'john'
 整行删除，包括 kid、public_key、discoverable、backup_eligible、backup_state 全部消失
 ```
 
-### 8.2 被删除用户下次登录时的拒绝分支
+### 10.2 被删除用户下次登录时的拒绝分支
 
 #### 场景 A：用户仍持有 1FA 会话，尝试 2FA WebAuthn 断言
 
@@ -816,7 +1109,7 @@ LoadUserInfo(ctx, "john")
 如果没有其他 2FA 方式 → 用户被锁定，无法完成 2FA
 ```
 
-### 8.3 断言拒绝返回给客户端的信息
+### 10.3 断言拒绝返回给客户端的信息
 
 **HTTP 响应格式**：
 
@@ -841,9 +1134,9 @@ LoadUserInfo(ctx, "john")
 
 ---
 
-## 9. 多设备/多域名同步状态
+## 11. 多设备/多域名同步状态
 
-### 9.1 凭据撤销的跨设备影响
+### 11.1 凭据撤销的跨设备影响
 
 | 场景 | 影响 |
 |------|------|
@@ -851,7 +1144,7 @@ LoadUserInfo(ctx, "john")
 | **不同设备** | 各有各的会话，撤销不影响对方已登录状态 |
 | **Passkey 同步** | 硬件密钥内部的跨设备同步由厂商管理，Authelia 只在验证时检查凭据是否存在于数据库 |
 
-### 9.2 关键边界：Passkey 升级
+### 11.2 关键边界：Passkey 升级
 **位置**：`internal/handlers/webauthn.go:58-66`
 
 ```go
@@ -866,9 +1159,9 @@ if ctx.Configuration.WebAuthn.EnablePasskeyUpgrade {
 
 ---
 
-## 10. 丢失硬件密钥后的立即处置清单
+## 12. 丢失硬件密钥后的立即处置清单
 
-### 10.1 第一步：删除凭据（立刻执行）
+### 12.1 第一步：删除凭据（立刻执行）
 
 ```bash
 # 方式 A：删除该用户所有 WebAuthn 凭据（推荐，最安全）
@@ -895,7 +1188,7 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 - 删除是物理删除（DELETE FROM），**不可恢复**（除非有数据库备份）
 - 如果删除了用户的**唯一 2FA 方式**，用户将无法完成 2FA 登录
 
-### 10.2 第二步：处理活跃会话
+### 12.2 第二步：处理活跃会话
 
 **风险**：凭据删除后，用户在已登录设备上的会话仍然有效。
 
@@ -911,7 +1204,7 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 - 如果丢失的密钥有被冒用的高风险（如无 PIN 保护的 U2F 密钥），建议重启 Authelia 或清空 session store
 - 如果密钥有 PIN/生物识别保护，等待会话自然过期即可
 
-### 10.3 第三步：风险评估与后续处理
+### 12.3 第三步：风险评估与后续处理
 
 #### 风险评估检查项
 
@@ -947,9 +1240,9 @@ authelia storage user webauthn list <username> --config /etc/authelia/configurat
 
 ---
 
-## 11. 代码调用链总结
+## 13. 代码调用链总结
 
-### 11.1 用户删除流程
+### 13.1 用户删除流程
 ```
 前端 WebAuthnCredentialsPanel.tsx
     ↓ DELETE /api/secondfactor/webauthn/credential/{id}
@@ -965,7 +1258,7 @@ internal/storage/sql_provider.go:775
     ↓ DELETE FROM webauthn_credentials WHERE kid = ?
 ```
 
-### 11.2 管理员删除流程
+### 13.2 管理员删除流程
 ```
 authelia storage user webauthn delete
     ↓
@@ -976,7 +1269,7 @@ internal/commands/storage_run.go:1445 (StorageUserWebAuthnDeleteRunE)
     └─ byUser → DeleteWebAuthnCredentialByUsername(user, desc)
 ```
 
-### 11.3 登录时的撤销检测
+### 13.3 登录时的撤销检测
 ```
 POST /api/secondfactor/webauthn/assertion
     ↓
@@ -991,7 +1284,7 @@ internal/handlers/handler_sign_webauthn.go:129 (WebAuthnAssertionPOST)
 
 ---
 
-## 12. 相关文件索引
+## 14. 相关文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
