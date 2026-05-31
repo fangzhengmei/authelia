@@ -438,11 +438,389 @@ func (ctx *AutheliaCtx) setSpecialRedirect(uri string, statusCode int) ([]byte, 
 | Cookie 认证策略 | `internal/handlers/handler_authz_authn.go` | 90-147 |
 | 重定向 URL 构造 | `internal/handlers/handler_authz.go` | 266-288 |
 | 方法字符校验 | `internal/handlers/handler_authz_common.go` | 105-113 |
+| ACL 网络规则匹配 | `internal/authorization/types.go` | 14-26 |
+| ACL 规则总匹配 | `internal/authorization/access_control_rule.go` | 54-80 |
+| Authorizer.GetRequiredLevel | `internal/authorization/authorizer.go` | 51-68 |
+| Subject 结构体定义 | `internal/authorization/types.go` | 49-54 |
+| Regulation IP 封禁检查 | `internal/regulation/regulator.go` | 135-163 |
+| Regulation IP 封禁写入 | `internal/regulation/regulator.go` | 57-95 |
+| Regulation 登录尝试记录 | `internal/regulation/regulator.go` | 26-55 |
+| IP 速率限制桶 | `internal/middlewares/rate_limiting.go` | 98-163 |
+| IP 速率限制 FetchCtx | `internal/middlewares/rate_limiting.go` | 153-155 |
+| 错误处理 getRemoteIP | `internal/server/handlers.go` | 33-45 |
+| AutheliaCtx.RemoteIP 委托 | `internal/middlewares/authelia_context.go` | 518-520 |
+| XFF 解析测试用例 | `internal/middlewares/authelia_context_blackbox_test.go` | 34-63 |
 
-## 十、安全注意事项
+## 十、X-Forwarded-For 信任链深度分析
+
+### 10.1 X-Forwarded-For 从解析到策略判定的完整代码路径
+
+X-Forwarded-For 头解析出的客户端 IP 在 Authelia 中有**四个独立的消费方**，每个消费方的安全影响不同：
+
+```
+X-Forwarded-For 头
+       ↓
+RequestCtxRemoteIP()  ← 取逗号分隔的第一个 IP
+       ↓
+AutheliaCtx.RemoteIP()
+       ↓
+   ┌───┴────────────────────┬────────────────────┬──────────────────────┐
+   ↓                        ↓                    ↓                      ↓
+ACL 网络规则匹配      Regulation IP 封禁      IP 速率限制           日志记录
+(Subject.IP)         (BanCheck)             (IPRateLimitBucket)    (getRemoteIP)
+```
+
+#### 消费方1: ACL 网络规则匹配（影响授权决策）
+
+**调用链**:
+```
+handler_authz.go:192-200  →  Authorizer.GetRequiredLevel()
+                                ↓
+authorizer.go:51-68       →  rule.IsMatch(subject, object)
+                                ↓
+access_control_rule.go:71 →  acr.MatchesNetworks(subject)
+                                ↓
+access_control_rule.go:144→  acr.Networks.IsMatch(subject)
+                                ↓
+types.go:14-26            →  network.Contains(subject.IP)
+```
+
+**关键代码** (`handler_authz.go:192-200`):
+```go
+ruleHasSubject, required := ctx.GetProviders().Authorizer.GetRequiredLevel(
+    authorization.Subject{
+        Username: authn.Details.Username,
+        Groups:   authn.Details.Groups,
+        ClientID: authn.ClientID,
+        IP:       ctx.RemoteIP(),  // ← 来自 X-Forwarded-For 第一个 IP
+    },
+    object,
+)
+```
+
+**关键代码** (`authorization/types.go:14-26`):
+```go
+func (a AccessControlNetworks) IsMatch(subject Subject) bool {
+    if len(a) == 0 {
+        return true  // 规则未配置 networks 字段 → 不做 IP 过滤，直接匹配
+    }
+    for _, network := range a {
+        if network.Contains(subject.IP) {  // ← subject.IP 就是 X-Forwarded-For 解析值
+            return true
+        }
+    }
+    return false
+}
+```
+
+**影响范围**: 当 ACL 规则配置了 `networks` 字段时，X-Forwarded-For 的值直接决定请求是否被放行/拒绝。
+
+#### 消费方2: Regulation IP 封禁（影响登录尝试）
+
+**调用链**:
+```
+handler_firstfactor_password.go:50  →  Regulator.BanCheck(ctx, username)
+                                          ↓
+regulator.go:136                    →  ip := model.NewIP(ctx.RemoteIP())
+                                          ↓
+regulator.go:140                    →  store.LoadBannedIP(ctx, ip)
+                                          ↓
+regulator.go:57-95                  →  handleAttemptPossibleBannedIP()
+                                          ↓
+regulator.go:67                     →  ip := model.NewIP(ctx.RemoteIP())
+                                          ↓
+regulator.go:71                     →  store.LoadRegulationRecordsByIP(ctx, ip, ...)
+```
+
+**影响范围**:
+- 封禁检查：如果 X-Forwarded-For 伪造的 IP 恰好在封禁列表中，合法用户也无法登录
+- 封禁记录：如果 X-Forwarded-For 伪造的 IP 不在封禁列表中，被攻击的账号不会触发 IP 封禁
+- 封禁写入：封禁记录以伪造 IP 写入数据库，导致封禁完全无效
+
+#### 消费方3: IP 速率限制（影响请求放行）
+
+**调用链**:
+```
+rate_limiting.go:153-155  →  IPRateLimitBucket.FetchCtx(ctx)
+                                  ↓
+rate_limiting.go:154       →  l.Fetch(ctx.RemoteIP().String())
+                                  ↓
+rate_limiting.go:123-135   →  bucket[key]  // key = X-Forwarded-For 解析的 IP
+```
+
+**影响范围**: 速率限制以 X-Forwarded-For 解析的 IP 为键。伪造可让攻击者绕过限制，也可让伪造 IP 的合法用户被误限。
+
+#### 消费方4: 日志记录（影响审计追踪）
+
+**调用链**:
+```
+server/handlers.go:35-45  →  getRemoteIP(ctx)
+                                  ↓
+server/handlers.go:36-44   →  取 X-Forwarded-For 第一个 IP / RemoteIP()
+                                  ↓
+logging.Logger().WithField("remote_ip", getRemoteIP(ctx))
+```
+
+**影响范围**: 日志中的 IP 可能被伪造，导致安全审计时追踪到错误的来源。
+
+### 10.2 多层代理场景下 X-Forwarded-For 的拼接语义
+
+#### 各代理对 X-Forwarded-For 的处理行为
+
+**单层代理（标准场景）**:
+```
+客户端 (203.0.113.9) → 反向代理 → Authelia
+                              ↓
+X-Forwarded-For: 203.0.113.9
+TCP RemoteIP: 10.0.0.1 (代理内网 IP)
+Authelia 解析: 203.0.113.9 ✓ 正确
+```
+
+**双层代理（CDN + 反向代理）**:
+```
+客户端 (203.0.113.9) → CDN (198.51.100.1) → 反向代理 → Authelia
+                              ↓                    ↓
+X-Forwarded-For: 203.0.113.9       X-Forwarded-For: 203.0.113.9, 198.51.100.1
+TCP RemoteIP: CDN IP                                      TCP RemoteIP: 代理内网 IP
+Authelia 解析: 203.0.113.9 ✓ 正确
+```
+
+Authelia 用 `SplitN(header, ",", 2)` 只取第一个值，因此在双层代理**正确拼接**的场景下仍然能得到真实客户端 IP。
+
+#### Authelia 的 SplitN 策略分析
+
+**关键代码** (`internal/middlewares/wrap.go:34`):
+```go
+ips := strings.SplitN(string(header), ",", 2)  // 最多分成 2 段
+if len(ips) != 0 {
+    if ip := net.ParseIP(strings.Trim(ips[0], " ")); ip != nil {
+        return ip  // 只取第一段
+    }
+}
+```
+
+`SplitN(header, ",", 2)` 意味着：
+- `"203.0.113.9"` → `["203.0.113.9"]` → 取 `203.0.113.9`
+- `"203.0.113.9, 198.51.100.1"` → `["203.0.113.9", " 198.51.100.1"]` → 取 `203.0.113.9`
+- `"203.0.113.9, 198.51.100.1, 10.0.0.1"` → `["203.0.113.9", " 198.51.100.1, 10.0.0.1"]` → 取 `203.0.113.9`
+
+**结论**: 无论链路有多少层代理，只要每层代理按规范**追加**（append）到 X-Forwarded-For 末尾，Authelia 始终取最左侧（最原始）的 IP。
+
+#### 三层及以上代理的场景
+
+```
+客户端 (203.0.113.9) → CDN → WAF → 反向代理 → Authelia
+
+X-Forwarded-For: 203.0.113.9, 198.51.100.1, 10.0.0.5
+                  ↑              ↑             ↑
+                  客户端真实IP    CDN节点IP     WAF节点IP
+
+Authelia 解析: 203.0.113.9 ✓ 仍然正确
+```
+
+**前提**: 每一层代理都必须清除客户端自行设置的 X-Forwarded-For，再追加上一跳的 IP。
+
+### 10.3 代理侧 trusted proxies 配置不当的复现现象与风险边界
+
+#### 风险场景1: 反向代理未清除客户端自带的 X-Forwarded-For（最常见）
+
+**复现步骤**:
+```bash
+# 攻击者直接在请求中注入 X-Forwarded-For 头
+curl -H "X-Forwarded-For: 10.0.0.1" \
+     -H "X-Forwarded-Host: internal.example.com" \
+     -H "X-Forwarded-Proto: https" \
+     https://app.example.com/protected
+```
+
+**代理未清除时的头传递**:
+```
+客户端请求:  X-Forwarded-For: 10.0.0.1 (伪造)
+代理追加后: X-Forwarded-For: 10.0.0.1, 203.0.113.9 (真实客户端IP追加到末尾)
+Authelia 解析: 10.0.0.1 ← 取了伪造的值！
+```
+
+**复现现象**:
+1. **ACL 绕过**: 如果规则 `networks: [10.0.0.0/8]` 允许内网访问，攻击者伪造 `10.0.0.1` 后直接绕过
+2. **Regulation 绕过**: 攻击者每次请求伪造不同 IP，Regulation 的 IP 封禁完全失效
+3. **速率限制绕过**: 攻击者每次请求伪造不同 IP，IP 速率限制完全失效
+4. **日志污染**: 审计日志中记录的 IP 全部是伪造的，无法溯源
+
+#### 风险场景2: Traefik `trustedIPs` 配置不完整
+
+Traefik 的 `forwardingTimeouts` 和入口点配置中有 `trustedIPs`，决定是否信任上游传来的 X-Forwarded-For：
+
+```yaml
+# Traefik 配置示例
+entryPoints:
+  web:
+    forwardedHeaders:
+      trustedIPs:
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+```
+
+**配置不当的情况**:
+
+| 配置状态 | 客户端自带 XFF | Traefik 行为 | 传给 Authelia 的 XFF | 风险 |
+|---------|--------------|-------------|---------------------|------|
+| 未配置 trustedIPs | 有 | 信任并追加 | `伪造IP, 真实IP` | **高危**: Authelia 取伪造IP |
+| trustedIPs 包含 CDN IP | 有 | CDN 传来的 XFF 被信任 | `原始客户端IP, CDN IP, 真实IP` | **正常** |
+| trustedIPs 不含 CDN IP | 有 | 不信任，覆盖 XFF | `真实IP` | **安全但丢失原始IP** |
+| trustedIPs = 0.0.0.0/0 | 有 | 信任所有来源 | `伪造IP, 真实IP` | **高危**: 等同于未配置 |
+
+#### 风险场景3: Caddy `trusted_proxies` 配置不当
+
+Caddy v2 的 `trusted_proxies` 指令控制哪些上游代理的 X-Forwarded-For 被信任：
+
+```caddyfile
+forward_auth authelia:9091 {
+    trusted_proxies 10.0.0.0/8 192.168.0.0/16
+}
+```
+
+**Caddy 未配置 trusted_proxies 时的行为**: Caddy 默认不信任任何代理头，但 forward_auth 指令会设置 `X-Forwarded-For` 为直接连接的 IP，**覆盖**客户端自带的值。因此 Caddy 在此场景下相对安全。
+
+#### 风险场景4: Authelia 端口直接暴露
+
+如果 Authelia 的监听端口可以被非代理来源直接访问：
+
+```
+攻击者 → Authelia:9091 (直连，不经代理)
+X-Forwarded-For: 10.0.0.1 (任意伪造)
+TCP RemoteIP: 攻击者真实IP
+Authelia 解析: 10.0.0.1 ← 取了伪造的值
+```
+
+**复现**:
+```bash
+# 如果 Authelia 端口未做网络隔离
+curl -H "X-Forwarded-For: 10.0.0.1" \
+     http://authelia-internal:9091/api/authz/forward-auth
+```
+
+#### 各场景风险等级汇总
+
+| 风险场景 | 前提条件 | ACL 绕过 | Regulation 绕过 | 速率限制绕过 | 日志污染 | 风险等级 |
+|---------|---------|---------|----------------|------------|---------|---------|
+| 代理未清除客户端 XFF | 代理配置缺失 | ✅ | ✅ | ✅ | ✅ | **严重** |
+| Traefik trustedIPs 过宽 | 0.0.0.0/0 | ✅ | ✅ | ✅ | ✅ | **严重** |
+| Traefik trustedIPs 遗漏 CDN | 不含 CDN IP | ❌ | ❌ | ❌ | ⚠️ IP丢失 | **中** |
+| Authelia 端口直连 | 网络隔离缺失 | ✅ | ✅ | ✅ | ✅ | **严重** |
+| Caddy 未配 trusted_proxies | 默认行为 | ❌ | ❌ | ❌ | ❌ | **低** |
+
+### 10.4 为什么 Authelia 不实现 TrustedProxies
+
+通过代码分析，Authelia 选择不在应用层实现 TrustedProxies 的原因：
+
+1. **架构设计哲学**: forward-auth 模式下，Authelia 只接收来自反向代理的请求，代理是**唯一**与 Authelia 建立 TCP 连接的对端。Authelia 无法区分代理发来的 X-Forwarded-For 中哪些条目是代理追加的、哪些是客户端自带的。
+
+2. **代码中的唯一 IP 来源** (`wrap.go:32-44`): Authelia 的 `RequestCtxRemoteIP` 只做最简单的"取第一个 IP"，将信任决策完全交给代理层。
+
+3. **server/handlers.go 中的重复实现** (`handlers.go:33-45`): 错误处理函数中有独立的 `getRemoteIP` 实现，逻辑与 `RequestCtxRemoteIP` 完全一致——都无条件取 X-Forwarded-For 的第一个值。
+
+4. **正确的信任边界**: 代理应该：
+   - 在收到客户端请求时，**先删除**客户端自带的 X-Forwarded-For
+   - 然后**追加**客户端的真实 IP（TCP 连接的远端地址）
+   - 这样 Authelia 收到的 X-Forwarded-For 第一个值始终是代理写入的，可信任
+
+### 10.5 各代理的安全配置参考
+
+#### Traefik（最关键）
+
+```yaml
+# 正确配置：只信任上一跳代理
+entryPoints:
+  web:
+    forwardedHeaders:
+      trustedIPs:
+        - "10.0.0.0/8"      # 内网 CDN/WAF
+        - "172.16.0.0/12"    # 内网 Docker 网络
+    proxyProtocol:
+      trustedIPs:
+        - "10.0.0.0/8"
+
+# forward-auth 中间件
+http:
+  middlewares:
+    authelia:
+      forwardAuth:
+        address: "http://authelia:9091/api/authz/forward-auth"
+        authResponseHeaders:
+          - Remote-User
+          - Remote-Groups
+          - Remote-Name
+          - Remote-Email
+```
+
+#### Caddy
+
+```caddyfile
+# Caddy 默认行为安全，forward_auth 会覆盖客户端 XFF
+forward_auth authelia:9091 {
+    uri /api/authz/forward-auth
+    trusted_proxies 10.0.0.0/8 172.16.0.0/12
+    copy_headers Remote-User Remote-Groups Remote-Name Remote-Email
+}
+```
+
+#### NGINX
+
+```nginx
+# 关键：先清除再设置
+location / {
+    # 清除客户端自带的头
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # $proxy_add_x_forwarded_for 会自动追加，但不会清除客户端自带的
+    # 需要配合 set_real_ip_from 使用
+
+    # 设置受信代理
+    set_real_ip_from 10.0.0.0/8;
+    set_real_ip_from 172.16.0.0/12;
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    auth_request /authz;
+    auth_request_set $remote_user $upstream_http_remote_user;
+    proxy_set_header Remote-User $remote_user;
+}
+
+location = /authz {
+    internal;
+    proxy_pass http://authelia:9091/api/authz/forward-auth;
+    proxy_set_header X-Forwarded-Method $request_method;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-URI $request_uri;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+### 10.6 验证 X-Forwarded-For 信任链是否安全的检查清单
+
+1. **代理是否清除客户端自带的 X-Forwarded-For？**
+   - Traefik: 检查 `forwardedHeaders.trustedIPs` 是否正确配置
+   - Caddy: 默认安全（forward_auth 模式下）
+   - NGINX: 检查 `set_real_ip_from` + `real_ip_recursive on`
+
+2. **Authelia 端口是否只对代理暴露？**
+   - 检查网络策略/防火墙规则
+   - Authelia 不应有公网可达的端口
+
+3. **多层代理的 X-Forwarded-For 拼接顺序是否正确？**
+   - 每层代理应该追加到末尾，不能前置
+   - 用 `curl -v` 检查 Authelia 收到的实际头
+
+4. **ACL 网络规则是否依赖 X-Forwarded-For？**
+   - 配置 `networks` 字段的规则要意识到 IP 可能被伪造
+   - 对关键资源，优先使用 `subject: [user:xxx, group:xxx]` 而非 `networks`
+
+## 十一、安全注意事项
 
 1. **无受信代理白名单**：Authelia 无条件信任所有 `X-Forwarded-*` 头，必须由反向代理确保这些头不被客户端伪造
 2. **方法仅做字符校验**：`X-Forwarded-Method` 只检查是否为大写字母，不校验是否为合法 HTTP 方法
 3. **URL 拼接安全**：`getRequestURIFromForwardedHeaders` 使用 `url.ParseRequestURI` 解析，能防止大部分 URL 伪造攻击
 4. **Session-Username 头校验**：Cookie 认证时会检查 `Session-Username` 请求头与会话用户名是否一致，防止 Cookie 劫持
 5. **HTTPS 强制**：目标 URL 必须是 `https` 或 `wss` 协议，确保 Session Cookie 安全传输
+6. **X-Forwarded-For 影响四个子系统**：ACL 网络规则、Regulation IP 封禁、IP 速率限制、日志审计——任意一个被伪造 IP 欺骗都有实际安全影响
+7. **XFF 伪造的杀伤力取决于 ACL 配置**：如果未使用 `networks` 规则，ACL 层面不受影响；但 Regulation 和速率限制始终受影响
